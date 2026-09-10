@@ -80,18 +80,34 @@ class MCPServer:
             await self._handle_tool_call(msg, msg_id)
         elif msg_type == "notifications/initialized":
             # SDK sends this notification after initialize — no response expected
-            pass
+            logger.debug("Received notifications/initialized")
+        elif msg_type == "logging/setLevel":
+            # Inspector uses this to set log level — no response expected
+            logger.debug("Received logging/setLevel")
+        elif msg_type == "logging/message":
+            # Some clients send logging messages — no response expected
+            logger.debug("Received logging/message")
         elif msg_type is None:
             # Notification without a method field — ignore (no response)
             pass
         else:
             # Only send responses to requests that have an id
             if msg_id is not None:
-                await self._send_response(msg_id, None)
+                logger.warning("Unknown method: %s, id=%s", msg_type, msg_id)
+                error_resp = {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "error": {
+                        "code": -32601,
+                        "message": f"Method not found: {msg_type}",
+                    },
+                }
+                await self._write(error_resp)
 
     async def _handle_initialize(self, msg_id: Any) -> None:
         """Handle MCP initialize handshake."""
         self._initialized = True
+        logger.info("[MCP] initialization complete")
         response = {
             "jsonrpc": "2.0",
             "id": msg_id,
@@ -121,6 +137,7 @@ class MCPServer:
 
     async def _handle_tool_list(self, msg_id: Any) -> None:
         """List available tools."""
+        logger.info("[MCP] tools/list")
         response = {
             "jsonrpc": "2.0",
             "id": msg_id,
@@ -173,7 +190,8 @@ class MCPServer:
         timeout_ms = arguments.get("timeout", REQUEST_TIMEOUT_MS)
 
         logger.info(
-            "ask_chatgpt entered: prompt_len=%d, extension_connected=%s, timeout_ms=%d",
+            "[MCP] ask_chatgpt req=%s entered: prompt_len=%d, extension_connected=%s, timeout_ms=%d",
+            msg_id,
             len(prompt),
             self._state.extension_connected,
             timeout_ms,
@@ -332,16 +350,21 @@ class MCPServer:
         except asyncio.TimeoutError:
             request.state = RequestState.TIMED_OUT
             self._request_manager.complete_request(request_id, error_code=ErrorCode.CHATGPT_TIMEOUT.value)
+            elapsed = time.time() - request.created_at
+            stage_info = ""
+            if request.last_stage:
+                stage_info = f" last_stage={request.last_stage} elapsed={elapsed:.1f}s"
+            error_msg = ErrorCode.CHATGPT_TIMEOUT.value + stage_info
             error_resp = {
                 "jsonrpc": "2.0",
                 "id": msg_id,
                 "error": {
                     "code": -32005,
-                    "message": ErrorCode.CHATGPT_TIMEOUT.value,
+                    "message": error_msg,
                 },
             }
             await self._write(error_resp)
-            logger.warning("Request %s timed out", request_id)
+            logger.warning("Request %s timed out%s", request_id, stage_info)
 
     def _on_request_complete(self, request_id: str) -> None:
         """Called when a request completes — activate the next queued request."""
@@ -378,7 +401,7 @@ class MCPServer:
 
     async def run(self) -> None:
         """Run the MCP server, reading from stdin."""
-        logger.info("MCP server started, reading from stdin")
+        logger.info("[MCP] process started")
 
         # Periodic cleanup of expired requests
         asyncio.create_task(self._cleanup_loop())
@@ -397,7 +420,14 @@ class MCPServer:
                 logger.info("Empty line from stdin (EOF), shutting down")
                 break
 
-            await self.handle_message(line)
+            try:
+                await self.handle_message(line)
+            except asyncio.CancelledError:
+                # Request timeout cancelled this coroutine — do NOT propagate.
+                # Clean up and continue processing the next message.
+                logger.warning("Request cancelled/timeout — continuing server loop")
+            except Exception:
+                logger.exception("Unhandled error in message handling — continuing")
 
     async def _cleanup_loop(self) -> None:
         """Periodically clean up expired requests."""

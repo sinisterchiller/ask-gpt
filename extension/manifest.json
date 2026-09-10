@@ -5,9 +5,11 @@
   "version": "0.1.0",
   "permissions": [
     "storage",
-    "tabs"
+    "tabs",
+    "scripting"
   ],
   "host_permissions": [
+    "https://chatgpt.com/*",
     "http://127.0.0.1:8765/*"
   ],
   "background": {

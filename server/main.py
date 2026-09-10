@@ -95,7 +95,7 @@ async def main() -> None:
     token_server = await start_token_http_server(state, port=8766)
 
     # Run MCP server (reads from stdin)
-    # Run both concurrently
+    # Use a stop event so we can gracefully shut down on signal
     stop_event = asyncio.Event()
 
     def _signal_handler() -> None:
@@ -110,30 +110,33 @@ async def main() -> None:
             # Windows doesn't support add_signal_handler
             pass
 
+    # Run MCP server and shutdown trigger concurrently.
+    # The MCP server runs until stdin closes (EOF).
+    # Signals set stop_event, which triggers shutdown.
+    # Request timeouts are handled inside the MCP server loop
+    # and do NOT propagate here.
+    mcp_task = asyncio.create_task(mcp_server.run())
+
     try:
-        mcp_task = asyncio.create_task(mcp_server.run())
-        stop_task = asyncio.create_task(stop_event.wait())
-
-        done, pending = await asyncio.wait(
-            {mcp_task, stop_task},
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-
-        for task in pending:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        await asyncio.gather(mcp_task, stop_event.wait())
     except asyncio.CancelledError:
         pass
     finally:
+        # Gracefully shut down: close WebSocket, then the MCP server
+        # will exit when stdin is closed.
         await ws_server.stop()
         token_server.close()
         try:
             await token_server.wait_closed()
         except Exception:
             pass
+        # Cancel MCP task if still running (e.g., stdin not closed)
+        if not mcp_task.done():
+            mcp_task.cancel()
+            try:
+                await mcp_task
+            except asyncio.CancelledError:
+                pass
         logger.info("Bridge server stopped")
 
 

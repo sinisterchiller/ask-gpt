@@ -12,6 +12,23 @@
 "use strict";
 
 // ------------------------------------------------------------------
+// Initialization guard — prevent duplicate listeners on re-injection
+// ------------------------------------------------------------------
+
+if (globalThis.__chatgptBridgeListenerRegistered) {
+  // Listener already registered (survives re-injection).
+  console.log("[chatgpt-bridge] Listener already registered, skipping.");
+} else {
+  globalThis.__chatgptBridgeListenerRegistered = true;
+  globalThis.__chatgptBridgeInitialized = true;
+
+  // All content-script code goes inside this block.
+  initContentScript();
+}
+
+function initContentScript() {
+
+// ------------------------------------------------------------------
 // Selectors — isolated from the rest of the extension
 // ------------------------------------------------------------------
 
@@ -105,8 +122,19 @@ var SELECTORS = {
 var state = "IDLE";
 var lastMessageCount = 0;
 var mutationObserver = null;
-var stabilizationTimer = null;
 var stateTimer = null;
+
+// Shared by waitForResponse and startObservation
+var messageEl = null;
+var stableCount = 0;
+var lastRequestId = null;
+var lastText = "";
+var responseResolve = null; // Promise resolve from waitForResponse
+var responseTimeoutHandle = null;
+var generationStartAt = 0; // Timestamp when generation observation started
+
+// Synchronous lock to prevent duplicate submissions from multiple listeners
+var processingLock = false;
 
 // ------------------------------------------------------------------
 // Message handling
@@ -114,10 +142,43 @@ var stateTimer = null;
 
 chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
   if (request.action === "submit_prompt") {
-    submitPrompt(request.prompt).then(function (result) {
+    var diagRequestId = request.requestId || "unknown";
+    console.log("[content script] submit_prompt received");
+    chrome.runtime.sendMessage({
+      action: "diagnostic",
+      requestId: diagRequestId,
+      stage: "content_script_received",
+      message: "prompt_len=" + (request.prompt || "").length,
+    });
+    // Synchronous lock — prevents duplicate submissions even when
+    // multiple listeners fire in the same event loop tick.
+    if (processingLock) {
+      console.log("[content script] submit_prompt ignored — lock held");
+      sendResponse({ success: false, error: "Already processing a request", code: "ALREADY_PROCESSING" });
+      return false;
+    }
+    processingLock = true;
+
+    submitPrompt(diagRequestId, request.prompt).then(function (result) {
+      console.log("[content script] submit_prompt result:", result);
+      chrome.runtime.sendMessage({
+        action: "diagnostic",
+        requestId: diagRequestId,
+        stage: "content_response_sent",
+        message: "success=" + (result ? result.success : "null"),
+      });
       sendResponse(result);
     }).catch(function (err) {
+      console.log("[content script] submit_prompt error:", err.message);
+      chrome.runtime.sendMessage({
+        action: "diagnostic",
+        requestId: diagRequestId,
+        stage: "content_error",
+        message: err.message,
+      });
       sendResponse({ success: false, error: err.message, code: err.code || "UNKNOWN_ERROR" });
+    }).finally(function () {
+      processingLock = false;
     });
     return true;
   }
@@ -132,10 +193,17 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
   }
 
   if (request.action === "check_tab") {
+    console.log("[content script] check_tab: isChatGPT=" + isChatGPTPage() + " ready=" + isChatGPTReady());
     sendResponse({
       isChatGPT: isChatGPTPage(),
       ready: isChatGPTReady(),
     });
+    return false;
+  }
+
+  if (request.action === "tab_assigned") {
+    console.log("[content script] tab_assigned received");
+    sendResponse({ ok: true });
     return false;
   }
 
@@ -146,51 +214,116 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
 // Public API
 // ------------------------------------------------------------------
 
-function submitPrompt(prompt) {
+function submitPrompt(requestId, prompt) {
   return new Promise(function (resolve, reject) {
     resetState();
     state = "SUBMITTED";
 
+    chrome.runtime.sendMessage({
+      action: "diagnostic",
+      requestId: requestId,
+      stage: "submit_prompt_started",
+    });
+
     try {
       if (!isChatGPTReady()) {
+        var isChatGPT = isChatGPTPage();
+        var composerEl = getComposer();
+        chrome.runtime.sendMessage({
+          action: "diagnostic",
+          requestId: requestId,
+          stage: "not_ready",
+          message: "isChatGPT=" + isChatGPT + " composer=" + (composerEl !== null),
+        });
         throw createError("CHATGPT_NOT_READY", "ChatGPT page is not ready");
       }
 
       var composer = getComposer();
       if (!composer) {
+        chrome.runtime.sendMessage({
+          action: "diagnostic",
+          requestId: requestId,
+          stage: "composer_not_found",
+        });
         throw createError("CHATGPT_COMPOSER_NOT_FOUND", "Could not find composer");
       }
 
+      chrome.runtime.sendMessage({
+        action: "diagnostic",
+      requestId: requestId,
+        stage: "composer_found",
+        message: "type=" + composer.tagName + " className=" + (composer.className || "").substring(0, 50),
+      });
       lastMessageCount = SELECTORS.assistantMessages().length;
+      chrome.runtime.sendMessage({
+        action: "diagnostic",
+      requestId: requestId,
+        stage: "message_count_recorded",
+        message: "count=" + lastMessageCount,
+      });
 
       // Insert text
       setComposerText(composer, prompt);
+
+      // Verify insertion
+      var insertedText = composer.innerText || composer.value || "";
+      var insertionOk = insertedText.includes(prompt.substring(0, Math.min(20, prompt.length)));
+      chrome.runtime.sendMessage({
+        action: "diagnostic",
+      requestId: requestId,
+        stage: "prompt_inserted",
+        message: "insertion_ok=" + insertionOk + " text_preview=" + insertedText.substring(0, 50),
+      });
+
+      if (!insertionOk && insertedText.length > 0) {
+        chrome.runtime.sendMessage({
+          action: "diagnostic",
+      requestId: requestId,
+          stage: "insertion_mismatch",
+          message: "expected_contains=" + prompt.substring(0, 20) + " got=" + insertedText.substring(0, 50),
+        });
+      }
 
       // Wait for React to re-render (send button changes from voice to send icon)
       // and for the input events to propagate
       setTimeout(function () {
         var sendButton = getSendButton();
         if (!sendButton) {
+          chrome.runtime.sendMessage({
+            action: "diagnostic",
+      requestId: requestId,
+            stage: "send_button_not_found",
+          });
           reject(createError("CHATGPT_SEND_BUTTON_NOT_FOUND", "Could not find send button"));
           return;
         }
 
-        // Click the send button
+        chrome.runtime.sendMessage({
+          action: "diagnostic",
+      requestId: requestId,
+          stage: "send_button_found",
+          message: "ariaLabel=" + (sendButton.getAttribute("aria-label") || "").substring(0, 50),
+        });
+
+        // Click the send button — sufficient to submit
         sendButton.click();
+        chrome.runtime.sendMessage({
+          action: "diagnostic",
+      requestId: requestId,
+          stage: "send_triggered",
+        });
 
-        // Also try Enter key as fallback
-        composer.dispatchEvent(new KeyboardEvent("keydown", {
-          key: "Enter",
-          code: "Enter",
-          bubbles: true,
-          cancelable: true,
-        }));
-
-        waitForResponse().then(resolve).catch(reject);
+        waitForResponse(requestId).then(resolve).catch(reject);
       }, 200);
 
     } catch (err) {
       state = "ERROR";
+      chrome.runtime.sendMessage({
+        action: "diagnostic",
+      requestId: requestId,
+        stage: "submit_error",
+        message: err.message,
+      });
       reject(err);
     }
   });
@@ -264,13 +397,33 @@ function setComposerText(composer, text) {
   composer.dispatchEvent(new Event("change", { bubbles: true }));
 }
 
-function waitForResponse() {
+function waitForResponse(requestId) {
   return new Promise(function (resolve, reject) {
     var timeoutMs = 300000;
-    var timeoutHandle = setTimeout(function () {
+
+    // Set module-level state for startObservation to access
+    messageEl = null;
+    stableCount = 0;
+    lastText = "";
+    lastRequestId = requestId;
+    responseResolve = resolve;
+    generationStartAt = Date.now();
+    responseTimeoutHandle = setTimeout(function () {
       cleanup();
+      chrome.runtime.sendMessage({
+        action: "diagnostic",
+      requestId: requestId,
+        stage: "response_timeout",
+        message: "timeout_ms=" + timeoutMs,
+      });
       reject(createError("CHATGPT_TIMEOUT", "No response received within timeout"));
     }, timeoutMs);
+
+    chrome.runtime.sendMessage({
+      action: "diagnostic",
+      requestId: requestId,
+      stage: "waiting_for_response",
+    });
 
     startObservation();
 
@@ -278,15 +431,22 @@ function waitForResponse() {
       var newCount = SELECTORS.assistantMessages().length;
 
       if (newCount > lastMessageCount) {
+        chrome.runtime.sendMessage({
+          action: "diagnostic",
+      requestId: requestId,
+          stage: "assistant_detected",
+          message: "count=" + newCount + " lastMessageCount=" + lastMessageCount,
+        });
         clearInterval(pollInterval);
         var messages = SELECTORS.assistantMessages();
         var newMsgEl = messages[messages.length - 1];
         if (newMsgEl) {
-          startGenerationObserver(newMsgEl, function (text) {
-            cleanup();
-            clearTimeout(timeoutHandle);
-            state = "COMPLETE";
-            resolve({ success: true, response: text });
+          // Set module-level for startObservation
+          messageEl = newMsgEl;
+          chrome.runtime.sendMessage({
+            action: "diagnostic",
+      requestId: requestId,
+            stage: "assistant_message_element_found",
           });
         }
       } else {
@@ -294,6 +454,11 @@ function waitForResponse() {
         if (errorEl && errorEl.offsetParent !== null) {
           clearInterval(pollInterval);
           cleanup();
+          chrome.runtime.sendMessage({
+            action: "diagnostic",
+      requestId: requestId,
+            stage: "generation_error_detected",
+          });
           reject(createError("CHATGPT_GENERATION_ERROR", "ChatGPT encountered an error"));
         }
       }
@@ -301,49 +466,103 @@ function waitForResponse() {
   });
 }
 
-function startGenerationObserver(messageEl, onComplete) {
-  var lastText = "";
-  var stableCount = 0;
-
-  mutationObserver = new MutationObserver(function (mutations) {
-    var currentText = messageEl.innerText || "";
-
-    var stopBtn = getStopButton();
-    var stopVisible = stopBtn !== null;
-
-    if (currentText !== lastText) {
-      if (state !== "GENERATING") {
-        state = "GENERATING";
-      }
-      lastText = currentText;
-      stableCount = 0;
-    }
-
-    if (stopVisible && state === "GENERATING") {
-      // Still generating
-    } else if (!stopVisible && currentText === lastText && state === "GENERATING") {
-      stableCount++;
-      if (stableCount >= 3) {
-        stabilizationTimer = setTimeout(function () {
-          var finalText = messageEl.innerText || "";
-          onComplete(finalText);
-        }, 1000);
-      }
-    }
-  });
-
-  mutationObserver.observe(document.body, {
-    childList: true,
-    characterData: true,
-    subtree: true,
-  });
-}
-
 function startObservation() {
   stateTimer = setInterval(function () {
     var stopBtn = getStopButton();
-    if (stopBtn === null && state === "GENERATING") {
-      state = "STABILIZING";
+    var stopVisible = false;
+    if (stopBtn) {
+      try {
+        var style = window.getComputedStyle(stopBtn);
+        stopVisible = style.display !== "none" &&
+                      style.visibility !== "hidden" &&
+                      style.opacity !== "0";
+      } catch (e) {
+        stopVisible = true;
+      }
+    }
+
+    if (stopVisible) {
+      // Still generating
+      return;
+    }
+
+    // Re-query assistant messages and pick the one with the most text.
+    // ChatGPT puts "Thinking" in one element and the actual response
+    // in a DIFFERENT element. We must follow the element that grows.
+    var allMsgs = SELECTORS.assistantMessages();
+    var bestEl = null;
+    var bestLen = 0;
+    for (var i = 0; i < allMsgs.length; i++) {
+      var t = allMsgs[i].innerText || "";
+      if (t.length > bestLen) {
+        bestLen = t.length;
+        bestEl = allMsgs[i];
+      }
+    }
+    if (!bestEl) return;
+
+    // If we switched to a different element (e.g., from Thinking to response),
+    // reset state for the new element
+    if (bestEl !== messageEl) {
+      messageEl = bestEl;
+      lastText = "";
+      stableCount = 0;
+    }
+
+    var currentText = messageEl.innerText || "";
+    var elapsed = Date.now() - generationStartAt;
+
+    // Diagnostic: log stabilization state every 3 checks
+    if (!startObservation._diagnosticCounter) startObservation._diagnosticCounter = 0;
+    startObservation._diagnosticCounter++;
+    if (startObservation._diagnosticCounter % 3 === 0) {
+      chrome.runtime.sendMessage({
+        action: "diagnostic",
+        requestId: lastRequestId,
+        stage: "stabilization_debug",
+        message: "elapsed=" + elapsed + " text_len=" + currentText.length +
+          " lastText_len=" + lastText.length +
+          " equal=" + (currentText === lastText) +
+          " len_gte_20=" + (currentText.length >= 20) +
+          " state=" + state +
+          " stableCount=" + stableCount +
+          " bestLen=" + bestLen,
+      });
+    }
+
+    // Require at least 2s of observation before stabilization.
+    // ChatGPT's stop button can disappear mid-stream during the
+    // "Thinking" phase, causing premature stabilization.
+    if (elapsed < 2000) return;
+    if (currentText === lastText && currentText.length >= 20 && state === "GENERATING") {
+      stableCount++;
+      if (stableCount >= 3) {
+        clearInterval(stateTimer);
+        stateTimer = null;
+        cleanup();
+        clearTimeout(responseTimeoutHandle);
+        chrome.runtime.sendMessage({
+          action: "diagnostic",
+          requestId: lastRequestId,
+          stage: "stabilization_threshold_reached",
+          message: "stable_count=" + stableCount + " text_len=" + currentText.length,
+        });
+        chrome.runtime.sendMessage({
+          action: "diagnostic",
+          requestId: lastRequestId,
+          stage: "response_extracted",
+          message: "length=" + currentText.length,
+        });
+        state = "COMPLETE";
+        if (responseResolve) responseResolve({ success: true, response: currentText });
+      }
+    } else if (currentText !== lastText) {
+      // Text changed — reset stabilization counter
+      lastText = currentText;
+      stableCount = 0;
+      if (state !== "GENERATING") {
+        state = "GENERATING";
+      }
     }
   }, 1000);
 }
@@ -352,10 +571,6 @@ function cleanup() {
   if (mutationObserver) {
     mutationObserver.disconnect();
     mutationObserver = null;
-  }
-  if (stabilizationTimer) {
-    clearTimeout(stabilizationTimer);
-    stabilizationTimer = null;
   }
   if (stateTimer) {
     clearTimeout(stateTimer);
@@ -366,6 +581,10 @@ function cleanup() {
 function resetState() {
   state = "IDLE";
   cleanup();
+  messageEl = null;
+  stableCount = 0;
+  lastText = "";
+  generationStartAt = 0;
 }
 
 function createError(code, message) {
@@ -378,3 +597,5 @@ function createError(code, message) {
 // Log readiness
 // ------------------------------------------------------------------
 console.log("[chatgpt-bridge] Content script loaded on", window.location.href);
+
+} // end initContentScript()

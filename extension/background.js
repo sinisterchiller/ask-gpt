@@ -5,6 +5,7 @@
  * - WebSocket connection to localhost bridge server
  * - Reconnection with backoff
  * - Tab assignment management (persisted)
+ * - Content-script injection and health checks
  * - Request routing to content script
  * - Response collection and forwarding
  */
@@ -25,11 +26,13 @@ const RECONNECT_FACTOR = 2;
 // ------------------------------------------------------------------
 
 let ws = null;
+let wsGeneration = 0; // Monotonically increasing generation ID for each WebSocket instance
 let wsToken = "";
 let assignedTabId = null;
 let bridgeEnabled = true;
 let reconnectAttempts = 0;
 let reconnectTimer = null;
+let lastPongAt = 0; // Last pong timestamp for heartbeat health check
 
 // ------------------------------------------------------------------
 // Service Worker persistence
@@ -71,52 +74,149 @@ async function saveState() {
 // WebSocket connection
 // ------------------------------------------------------------------
 
+/**
+ * Safe WebSocket send — single entry point that guards against null,
+ * closed connections, and stale generations.  Every send goes through
+ * here so there is exactly one place to check ws.readyState.
+ * @param {object} message
+ * @returns {boolean} true if sent, false if connection unavailable
+ */
+function safeWsSend(message) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(message));
+    return true;
+  }
+  return false;
+}
+
+
+/**
+ * Connect a new WebSocket with strict lifecycle isolation.
+ *
+ * Each connection gets its own local `socket` variable.
+ * All callbacks capture this variable and check
+ * `ws === socket` before acting, so stale callbacks from
+ * a previous connection can never mutate the state of a
+ * newer one.
+ *
+ * Generation IDs are logged for diagnostics.
+ */
 function connectWebSocket() {
+  // --- Guard: don't create a new socket if one is already OPEN or CONNECTING ---
   if (ws) {
+    if (
+      ws.readyState === WebSocket.OPEN ||
+      ws.readyState === WebSocket.CONNECTING
+    ) {
+      console.log("[chatgpt-bridge] Socket already " +
+        (ws.readyState === WebSocket.OPEN ? "open" : "connecting") +
+        " — skipping new connection");
+      return;
+    }
+    // Socket exists but is in CLOSING/CLOSED state — close it explicitly
+    // so the old socket's onclose fires before we create the new one.
     try { ws.close(); } catch (e) { /* ignore */ }
     ws = null;
   }
 
-  var url = SERVER_URL + (wsToken ? "?token=" + wsToken : "");
-  console.log("[chatgpt-bridge] Connecting to", url.replace(/token=[^&]*/, "token=***"));
+  // Increment generation — every new socket gets a unique ID
+  var generation = ++wsGeneration;
 
+  var url = SERVER_URL + (wsToken ? "?token=" + wsToken : "");
+  console.log(
+    "[chatgpt-bridge][WS#" + generation + "] Connecting to " +
+    url.replace(/token=[^&]*/, "token=***")
+  );
+
+  var socket;
   try {
-    ws = new WebSocket(url);
+    socket = new WebSocket(url);
   } catch (err) {
-    console.error("[chatgpt-bridge] WebSocket creation failed:", err);
+    console.error("[chatgpt-bridge][WS#" + generation + "] WebSocket creation failed:", err);
     scheduleReconnect();
     return;
   }
 
-  ws.onopen = function () {
-    console.log("[chatgpt-bridge] WebSocket connected");
+  // Install this socket as the global BEFORE assigning handlers,
+  // so safeWsSend can see it immediately.
+  ws = socket;
+
+  // ---- onopen ----
+  socket.onopen = function () {
+    if (ws !== socket) {
+      console.log("[chatgpt-bridge][WS#" + generation + "] late open ignored (generation " + wsGeneration + ")");
+      socket.close();
+      return;
+    }
+    console.log("[chatgpt-bridge][WS#" + generation + "] open");
     reconnectAttempts = 0;
 
-    ws.send(JSON.stringify({
+    socket.send(JSON.stringify({
       type: "hello",
       extensionVersion: "0.1.0",
     }));
+
+    console.log("[chatgpt-bridge][WS#" + generation + "] STATE bridgeEnabled=" +
+      bridgeEnabled + " assignedTabId=" + assignedTabId);
+    socket.send(JSON.stringify({
+      type: "tab_changed",
+      tabId: assignedTabId,
+      url: "",
+    }));
+    console.log("[chatgpt-bridge][WS#" + generation + "] sync_state sent");
   };
 
-  ws.onmessage = function (event) {
+  // ---- onmessage ----
+  socket.onmessage = function (event) {
+    if (ws !== socket) return;
     handleMessage(event.data);
   };
 
-  ws.onclose = function (event) {
-    console.log("[chatgpt-bridge] WebSocket closed:", event.code, event.reason);
-    ws = null;
-    scheduleReconnect();
+  // ---- onerror — diagnostics only, DO NOT clear ws or schedule reconnect ----
+  socket.onerror = function (err) {
+    if (ws !== socket) {
+      console.log("[chatgpt-bridge][WS#" + generation + "] late error ignored (generation " + wsGeneration + ")");
+      return;
+    }
+    console.error(
+      "[chatgpt-bridge][WS#" + generation + "] error — readyState=" + socket.readyState
+    );
+    // Do NOT set ws = null here. onclose is the authoritative
+    // lifecycle transition.  onerror does not guarantee the
+    // connection is closed.
   };
 
-  ws.onerror = function (err) {
-    console.error("[chatgpt-bridge] WebSocket error:", err);
+  // ---- onclose — authoritative lifecycle transition ----
+  socket.onclose = function (event) {
+    if (ws !== socket) {
+      console.log(
+        "[chatgpt-bridge][WS#" + generation + "] late close ignored " +
+        "(code=" + event.code + ", reason=\"" + event.reason + "\", clean=" + event.wasClean + ") " +
+        "generation=" + wsGeneration
+      );
+      return;
+    }
+    console.log(
+      "[chatgpt-bridge][WS#" + generation + "] closed " +
+      "(code=" + event.code + ", reason=\"" + event.reason + "\", clean=" + event.wasClean + ")"
+    );
+    ws = null;
+    scheduleReconnect();
   };
 }
 
 function scheduleReconnect() {
+  // Guard: never have more than one reconnect timer running
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
+  }
+
+  // Guard: never start a reconnect if an OPEN or CONNECTING socket exists
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+    console.log("[chatgpt-bridge] Reconnect skipped — socket already " +
+      (ws.readyState === WebSocket.OPEN ? "open" : "connecting"));
+    return;
   }
 
   var delay = Math.min(
@@ -125,18 +225,19 @@ function scheduleReconnect() {
   );
   reconnectAttempts++;
 
-  console.log("[chatgpt-bridge] Reconnecting in", delay, "ms (attempt", reconnectAttempts + 1, ")");
+  console.log("[chatgpt-bridge] Reconnecting in " + delay + "ms (attempt " + (reconnectAttempts + 1) + ")");
   reconnectTimer = setTimeout(function () {
+    reconnectTimer = null;
     connectWebSocket();
   }, delay);
 }
 
+/**
+ * @deprecated Use safeWsSend() instead.
+ * Kept for temporary backward compatibility.
+ */
 function sendMessage(msg) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(msg));
-    return true;
-  }
-  return false;
+  return safeWsSend(msg);
 }
 
 // ------------------------------------------------------------------
@@ -159,6 +260,12 @@ function handleMessage(raw) {
       console.log("[chatgpt-bridge] Server acknowledged, protocol version:", msg.protocolVersion);
       break;
 
+    case "pong":
+      // Heartbeat response from the server — update health timestamp.
+      // Distinguised from application-level content-script pings.
+      lastPongAt = Date.now();
+      break;
+
     case "prompt":
       handlePrompt(msg);
       break;
@@ -176,6 +283,150 @@ function handleMessage(raw) {
 }
 
 // ------------------------------------------------------------------
+// Content-script health check and auto-injection
+// ------------------------------------------------------------------
+
+/**
+ * Send a message to a content script with a real timeout.
+ * Chrome's sendMessage timeout option is unreliable in MV3.
+ * @param {number} tabId
+ * @param {object} message
+ * @param {number} timeoutMs
+ * @returns {Promise<*>}
+ */
+function sendMessageToContent(tabId, message, timeoutMs) {
+  return new Promise(function (resolve, reject) {
+    var timedOut = false;
+    var timer = setTimeout(function () {
+      timedOut = true;
+      reject(new Error("Content script did not respond within " + timeoutMs + "ms"));
+    }, timeoutMs);
+
+    chrome.tabs.sendMessage(tabId, message, function (response) {
+      if (timedOut) return;
+      clearTimeout(timer);
+
+      var lastError = chrome.runtime.lastError;
+      if (lastError) {
+        reject(new Error(lastError.message));
+        return;
+      }
+      resolve(response);
+    });
+  });
+}
+
+/**
+ * Check if the content script is loaded and responsive in the given tab.
+ * @param {number} tabId
+ * @returns {Promise<boolean>}
+ */
+function pingContentScript(tabId) {
+  return sendMessageToContent(tabId, { action: "check_tab" }, 2000)
+    .then(function (result) {
+      if (result && result.isChatGPT !== undefined) {
+        return true;
+      }
+      return false;
+    })
+    .catch(function (err) {
+      console.error("[content-script] ping failed: " + err.message);
+      return false;
+    });
+}
+
+/**
+ * Ensure the content script is loaded and responsive in the given tab.
+ *
+ * Flow:
+ *   1. Ping the content script.
+ *   2. If pong → done.
+ *   3. If no receiver → inject content.js via chrome.scripting.executeScript.
+ *   4. Wait for initialization, then ping again.
+ *   5. If still unavailable → throw explicit error.
+ *
+ * @param {number} tabId
+ * @returns {Promise<void>} Resolves when the content script is confirmed ready.
+ */
+async function ensureContentScript(tabId) {
+  // Step 1: Try ping first (fast path — script already loaded).
+  try {
+    var alive = await pingContentScript(tabId);
+    if (alive) {
+      console.log("[content-script] ping OK (pre-existing)");
+      return;
+    }
+  } catch (err) {
+    // Receiving end doesn't exist or other error — proceed to inject.
+    console.log("[content-script] ping failed, will inject: " + err.message);
+  }
+
+  // Step 2: Verify tab still exists and is a ChatGPT page.
+  var tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+    if (!tab || !tab.url || !tab.url.includes("chatgpt.com")) {
+      throw new Error("Tab is not a ChatGPT page");
+    }
+  } catch (err) {
+    console.error("[content-script] tab validation failed: " + err.message);
+    throw new Error(
+      "CONTENT_SCRIPT_UNAVAILABLE: Tab " + tabId + " is not a valid ChatGPT page. " + err.message
+    );
+  }
+
+  // Step 3: Inject content.js.
+  try {
+    console.log("[content-script] injecting content.js into tab " + tabId);
+    await chrome.scripting.executeScript({
+      target: { tabId: tabId, allFrames: false },
+      files: ["content.js"],
+    });
+  } catch (err) {
+    console.error("[content-script] injection failed: " + err.message);
+    throw new Error(
+      "CONTENT_SCRIPT_UNAVAILABLE: Failed to inject content.js into tab " + tabId + ". " + err.message
+    );
+  }
+
+  // Step 4: Wait for the injected script to initialize.
+  await new Promise(function (r) { setTimeout(r, 500); });
+
+  // Step 5: Re-ping to confirm.
+  var postInjectAlive = await pingContentScript(tabId);
+  if (!postInjectAlive) {
+    throw new Error(
+      "CONTENT_SCRIPT_UNAVAILABLE: No content-script receiver was available in assigned ChatGPT tab " +
+      tabId + ". Automatic reinjection failed."
+    );
+  }
+
+  console.log("[content-script] content script available (via auto-inject)");
+}
+
+// ------------------------------------------------------------------
+// Diagnostic forwarding
+// ------------------------------------------------------------------
+
+/**
+ * Send a diagnostic message to the Python server.
+ * @param {string} requestId
+ * @param {string} component
+ * @param {string} stage
+ * @param {string} [message]
+ */
+function sendDiagnostic(requestId, component, stage, message) {
+  safeWsSend({
+    type: "diagnostic",
+    requestId: requestId,
+    component: component,
+    stage: stage,
+    message: message || "",
+  });
+  console.log("[req_" + requestId + "] DIAGNOSTIC " + component + "/" + stage + (message ? ": " + message : ""));
+}
+
+// ------------------------------------------------------------------
 // Prompt handling
 // ------------------------------------------------------------------
 
@@ -184,8 +435,13 @@ async function handlePrompt(msg) {
   var prompt = msg.prompt;
   var timeout = msg.timeout || 300000;
 
+  console.log("[req_" + requestId + "] request received from server");
+  sendDiagnostic(requestId, "background", "request_received");
+
   // Validate bridge state
   if (!bridgeEnabled) {
+    console.log("[req_" + requestId + "] bridge disabled");
+    sendDiagnostic(requestId, "background", "bridge_disabled");
     sendResponse(requestId, null, {
       success: false,
       error: "Bridge is disabled",
@@ -195,6 +451,8 @@ async function handlePrompt(msg) {
   }
 
   if (!assignedTabId) {
+    console.log("[req_" + requestId + "] no assigned tab");
+    sendDiagnostic(requestId, "background", "no_assigned_tab");
     sendResponse(requestId, null, {
       success: false,
       error: "No ChatGPT tab assigned",
@@ -203,19 +461,26 @@ async function handlePrompt(msg) {
     return;
   }
 
+  console.log("[req_" + requestId + "] assigned tab=" + assignedTabId);
+  sendDiagnostic(requestId, "background", "tab_validated", "id=" + assignedTabId);
+
   // Send accepted back to server
-  sendMessage({
+  safeWsSend({
     type: "accepted",
     requestId: requestId,
   });
+  sendDiagnostic(requestId, "background", "accepted_sent");
 
   // Validate tab exists
+  var tab;
   try {
-    var tab = await chrome.tabs.get(assignedTabId);
+    tab = await chrome.tabs.get(assignedTabId);
     if (!tab) {
       throw new Error("Tab not found");
     }
   } catch (err) {
+    console.log("[req_" + requestId + "] tab not found, clearing assignment");
+    sendDiagnostic(requestId, "background", "tab_not_found", err.message);
     sendResponse(requestId, null, {
       success: false,
       error: "Assigned tab no longer exists",
@@ -228,6 +493,8 @@ async function handlePrompt(msg) {
 
   // Check if tab is a ChatGPT page
   if (!tab.url || !tab.url.includes("chatgpt.com")) {
+    console.log("[req_" + requestId + "] tab is not ChatGPT: " + tab.url);
+    sendDiagnostic(requestId, "background", "tab_not_chatgpt", tab.url);
     sendResponse(requestId, null, {
       success: false,
       error: "Assigned tab is not a ChatGPT page",
@@ -235,13 +502,39 @@ async function handlePrompt(msg) {
     });
     return;
   }
+  sendDiagnostic(requestId, "background", "tab_is_chatgpt", tab.url);
 
-  // Send prompt to content script
+  // Ensure content script is loaded and responsive.
+  // This handles both:
+  //   - Cold start: content script never loaded (extension reload after tab open)
+  //   - Warm path: content script already running
   try {
-    var result = await chrome.tabs.sendMessage(assignedTabId, {
+    await ensureContentScript(assignedTabId);
+  } catch (err) {
+    console.error("[req_" + requestId + "] content script unavailable: " + err.message);
+    sendDiagnostic(requestId, "background", "content_script_unavailable", err.message);
+    sendResponse(requestId, null, {
+      success: false,
+      error: err.message,
+      code: "CONTENT_SCRIPT_UNAVAILABLE",
+    });
+    return;
+  }
+  sendDiagnostic(requestId, "background", "content_script_ready", "ensured");
+
+  // Send prompt to content script with a real timeout.
+  try {
+    console.log("[req_" + requestId + "] sending to content script");
+    sendDiagnostic(requestId, "background", "dispatching_to_content", "action=submit_prompt");
+    var result = await sendMessageToContent(assignedTabId, {
       action: "submit_prompt",
       prompt: prompt,
-    }, { timeout: timeout });
+      requestId: requestId,
+    }, timeout);
+
+    console.log("[req_" + requestId + "] content script response:", result);
+    sendDiagnostic(requestId, "background", "content_response_received",
+      "success=" + (result ? result.success : "null") + " response_len=" + (result && result.response ? result.response.length : 0));
 
     sendResponse(requestId, result, {
       success: result.success,
@@ -251,35 +544,11 @@ async function handlePrompt(msg) {
 
   } catch (err) {
     console.error("[chatgpt-bridge] Content script error:", err.message);
-
-    // Try to re-check if tab is still valid
-    try {
-      var checkResult = await chrome.tabs.sendMessage(assignedTabId, {
-        action: "check_tab",
-      }, { timeout: 2000 });
-
-      if (!checkResult || !checkResult.isChatGPT) {
-        sendResponse(requestId, null, {
-          success: false,
-          error: "Assigned tab is not ChatGPT",
-          code: "CHATGPT_NOT_READY",
-        });
-        return;
-      }
-    } catch (checkErr) {
-      // Tab might be closed or unresponsive
-      sendResponse(requestId, null, {
-        success: false,
-        error: "Content script communication failed: " + err.message,
-        code: "CHATGPT_COMPOSER_NOT_FOUND",
-      });
-      return;
-    }
-
+    sendDiagnostic(requestId, "background", "content_script_error", err.message);
     sendResponse(requestId, null, {
       success: false,
-      error: "Timeout or error: " + err.message,
-      code: "CHATGPT_TIMEOUT",
+      error: "Content script error: " + err.message,
+      code: "CHATGPT_COMPOSER_NOT_FOUND",
     });
   }
 }
@@ -300,7 +569,7 @@ function sendResponse(requestId, result, serverMsg) {
       message: result ? result.error || "Unknown error" : "Unknown error",
     };
   }
-  sendMessage(serverMsg);
+  safeWsSend(serverMsg);
 }
 
 // ------------------------------------------------------------------
@@ -317,15 +586,25 @@ async function assignTab(tabId) {
     assignedTabId = tabId;
     await saveState();
 
-    // Notify content script
+    // Notify content script (may not be loaded yet — that's ok,
+    // ensureContentScript below will handle injection).
     try {
       await chrome.tabs.sendMessage(tabId, { action: "tab_assigned" });
     } catch (e) {
       // Content script may not be loaded yet — that's ok
     }
 
+    // Ensure content script is available before advertising the tab.
+    try {
+      await ensureContentScript(tabId);
+      console.log("[chatgpt-bridge] Content script verified in assigned tab", tabId);
+    } catch (err) {
+      console.warn("[chatgpt-bridge] Content script not ready in assigned tab", tabId, ":", err.message);
+      // Still assign the tab but note the issue — handlePrompt will retry.
+    }
+
     // Notify server
-    sendMessage({
+    safeWsSend({
       type: "tab_changed",
       tabId: tabId,
       url: tab.url,
@@ -340,7 +619,7 @@ async function assignTab(tabId) {
 async function unassignTab() {
   assignedTabId = null;
   await saveState();
-  sendMessage({
+  safeWsSend({
     type: "tab_changed",
     tabId: null,
     url: "",
@@ -353,6 +632,23 @@ async function unassignTab() {
 // ------------------------------------------------------------------
 
 chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
+  // Relay content script diagnostics to the server
+  if (request.action === "diagnostic") {
+    var stage = request.stage || "";
+    var message = request.message || "";
+    var diagRequestId = request.requestId || "";
+    console.log("[DIAGNOSTIC from content req=" + diagRequestId + "] stage=" + stage + " message=" + message);
+    // Send diagnostic to server
+    safeWsSend({
+      type: "diagnostic",
+      requestId: diagRequestId,
+      component: "content",
+      stage: stage,
+      message: message,
+    });
+    return false;
+  }
+
   if (request.action === "assign_tab") {
     assignTab(request.tabId).then(sendResponse);
     return true;
@@ -375,7 +671,7 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
   if (request.action === "toggle_bridge") {
     bridgeEnabled = request.enabled;
     saveState();
-    sendMessage({ type: "bridge_state", enabled: bridgeEnabled });
+    safeWsSend({ type: "bridge_state", enabled: bridgeEnabled });
     sendResponse({ success: true, enabled: bridgeEnabled });
     return false;
   }
@@ -410,7 +706,7 @@ chrome.tabs.onRemoved.addListener(function (tabId) {
     console.log("[chatgpt-bridge] Assigned tab was closed");
     assignedTabId = null;
     saveState();
-    sendMessage({
+    safeWsSend({
       type: "tab_changed",
       tabId: null,
       url: "",
@@ -442,7 +738,10 @@ setInterval(function () {
     console.log("[chatgpt-bridge] Connection lost, reconnecting...");
     connectWebSocket();
   } else {
-    sendMessage({ type: "ping" });
+    // Only send if this is still the current socket
+    if (wsGeneration > 0) {
+      safeWsSend({ type: "ping" });
+    }
   }
 }, 15000);
 

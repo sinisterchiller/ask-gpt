@@ -43,7 +43,7 @@ class RequestManager:
         )
         self._requests[request.request_id] = request
         self._queue.append(request)
-        logger.info("Request %s queued (queue_size=%d)", request.request_id, len(self._queue))
+        logger.info("[REQ %s] queued (queue_size=%d)", request.request_id, len(self._queue))
 
         # Auto-activate if nothing is active
         self._try_activate_next()
@@ -74,7 +74,7 @@ class RequestManager:
         request = self._queue.pop(0)
         request.state = RequestState.ACTIVE
         self._active = request
-        logger.info("Request %s activated", request.request_id)
+        logger.info("[REQ %s] activated", request.request_id)
         return request
 
     def complete_request(self, request_id: str, response: str = "", error_code: str = "") -> None:
@@ -91,7 +91,7 @@ class RequestManager:
             request.state = RequestState.FAILED
             request.error_code = error_code
         logger.info(
-            "Request %s %s (response_chars=%d)",
+            "[REQ %s] %s (response_chars=%d)",
             request_id,
             request.state.value,
             len(request.response),
@@ -120,7 +120,7 @@ class RequestManager:
         if request.state == RequestState.QUEUED:
             request.state = RequestState.CANCELLED
             self._queue = [r for r in self._queue if r.request_id != request_id]
-            logger.info("Request %s cancelled", request_id)
+            logger.info("[REQ %s] cancelled", request_id)
             # If nothing is active, try to activate next
             if self._active is None:
                 self._try_activate_next()
@@ -128,7 +128,7 @@ class RequestManager:
             request.state = RequestState.CANCELLED
             if self._active and self._active.request_id == request_id:
                 self._active = None
-            logger.info("Request %s cancelled (was active)", request_id)
+            logger.info("[REQ %s] cancelled (was active)", request_id)
             self._try_activate_next()
 
     def get_request(self, request_id: str) -> BridgeRequest | None:
@@ -143,7 +143,7 @@ class RequestManager:
         if self._active and self._active.is_expired():
             expired_ids.append(self._active.request_id)
             self._active.state = RequestState.TIMED_OUT
-            logger.warning("Active request %s timed out", self._active.request_id)
+            logger.warning("[REQ %s] timed out (active)", self._active.request_id)
             self._active = None
 
         # Check queued requests
@@ -152,7 +152,7 @@ class RequestManager:
             if req.is_expired():
                 req.state = RequestState.TIMED_OUT
                 expired_ids.append(req.request_id)
-                logger.warning("Queued request %s timed out", req.request_id)
+                logger.warning("[REQ %s] timed out (queued)", req.request_id)
             else:
                 remaining.append(req)
         self._queue = remaining

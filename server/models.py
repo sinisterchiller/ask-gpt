@@ -23,6 +23,7 @@ class ErrorCode(str, Enum):
     NO_CHATGPT_TAB = "NO_CHATGPT_TAB"
     ASSIGNED_TAB_CLOSED = "ASSIGNED_TAB_CLOSED"
     CHATGPT_NOT_READY = "CHATGPT_NOT_READY"
+    CONTENT_SCRIPT_UNAVAILABLE = "CONTENT_SCRIPT_UNAVAILABLE"
     CHATGPT_COMPOSER_NOT_FOUND = "CHATGPT_COMPOSER_NOT_FOUND"
     CHATGPT_SEND_BUTTON_NOT_FOUND = "CHATGPT_SEND_BUTTON_NOT_FOUND"
     CHATGPT_TIMEOUT = "CHATGPT_TIMEOUT"
@@ -46,6 +47,8 @@ class BridgeRequest:
     response: str = ""
     error_code: str = ""
     error_message: str = ""
+    last_stage: str = ""
+    last_stage_time: float = 0.0
 
     def is_expired(self) -> bool:
         elapsed_ms = (time.time() - self.created_at) * 1000

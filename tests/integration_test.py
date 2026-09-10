@@ -96,8 +96,20 @@ async def run_integration_test():
     log("INTEGRATION", f"Received: {hello_ack}")
 
     assert state.extension_connected is True
+    # Ready event is NOT set yet — must wait for tab_changed
+    assert ws_server._extension_ready_event.is_set() is False
+
+    # Send tab_changed to complete the handshake
+    await ws.send(json.dumps({
+        "type": "tab_changed",
+        "tabId": 123,
+        "url": "https://chatgpt.com/",
+    }))
+    await asyncio.sleep(0.1)
+
+    assert state.extension_connected is True
     assert ws_server._extension_ready_event.is_set() is True
-    log_ok("TEST 2", "PASS — extension connected, ready event set")
+    log_ok("TEST 2", "PASS — extension connected and synced, ready event set")
 
     # Readiness should return immediately
     start = asyncio.get_event_loop().time()
@@ -107,19 +119,11 @@ async def run_integration_test():
     assert duration < 0.5
     log_ok("TEST 2", f"PASS — readiness check passed in {duration:.3f}s")
 
-    # ---- Test 3: Assign tab ----
+    # ---- Test 3: Tab already assigned (from sync) ----
     print("", flush=True)
-    log("TEST 3", "Assign tab...")
-
-    await ws.send(json.dumps({
-        "type": "tab_changed",
-        "tabId": 123,
-        "url": "https://chatgpt.com/",
-    }))
-    await asyncio.sleep(0.1)
-
+    log("TEST 3", "Tab assigned via sync...")
     assert state.assigned_tab_id == 123
-    log_ok("TEST 3", "PASS — tab assigned")
+    log_ok("TEST 3", "PASS — tab assigned via sync")
 
     # ---- Test 4: Full dispatch + response cycle ----
     print("", flush=True)
@@ -178,6 +182,18 @@ async def run_integration_test():
 
     ws2 = await websockets.connect(uri)
     await asyncio.wait_for(ws2.recv(), timeout=5.0)
+
+    assert state.extension_connected is True
+    # Ready event NOT set yet — need tab_changed
+    assert ws_server._extension_ready_event.is_set() is False
+
+    # Send tab_changed to complete sync
+    await ws2.send(json.dumps({
+        "type": "tab_changed",
+        "tabId": 123,
+        "url": "https://chatgpt.com/",
+    }))
+    await asyncio.sleep(0.1)
 
     assert state.extension_connected is True
     assert ws_server._extension_ready_event.is_set() is True

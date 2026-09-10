@@ -21,6 +21,7 @@ MSG_TAB_CHANGED = "tab_changed"
 MSG_BRIDGE_STATE = "bridge_state"
 MSG_PING = "ping"
 MSG_PONG = "pong"
+MSG_DIAGNOSTIC = "diagnostic"
 
 VALID_TYPES = {
     MSG_HELLO,
@@ -33,6 +34,7 @@ VALID_TYPES = {
     MSG_BRIDGE_STATE,
     MSG_PING,
     MSG_PONG,
+    MSG_DIAGNOSTIC,
 }
 
 VALID_EXTENSION_HELLO_TYPES = {MSG_HELLO}

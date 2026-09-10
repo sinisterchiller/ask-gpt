@@ -33,10 +33,12 @@ class WebSocketServer:
         self._ws_ready = asyncio.Event()
         self._disconnected_event = asyncio.Event()
         self._disconnected_event.set()
-        # Event set when extension connects, cleared on disconnect.
-        # Used by the MCP handler to wait for extension readiness
-        # instead of failing immediately on first invocation.
+        # Event set when extension's initial sync completes (tab_changed received).
+        # This is different from _ws_connected — the extension must send
+        # tab_changed after connecting so the server knows the assigned tab.
         self._extension_ready_event: asyncio.Event = asyncio.Event()
+        # Track whether the current connection has completed initial sync
+        self._sync_complete = False
 
     async def connect(self) -> ServerConnection:
         """Establish the WebSocket server."""
@@ -49,6 +51,9 @@ class WebSocketServer:
             PORT,
             process_request=self._process_request,
             max_size=2**20,  # 1MB max message
+            # Default ping_interval=20, ping_timeout=20 — browser handles
+            # protocol-level ping/pong transparently; application-level
+            # pings ({"type":"ping"}) are a separate keepalive layer.
         )
         logger.info("WebSocket server listening on ws://%s:%d%s", HOST, PORT, WS_PATH)
         return self._ws  # type: ignore[return-value]
@@ -86,13 +91,17 @@ class WebSocketServer:
 
     async def _handler(self, ws: ServerConnection, path: str = "/ws") -> None:
         """Handle a single WebSocket connection."""
-        logger.info("Extension connecting...")
+        logger.info("[WS] extension connection attempt")
 
         self._ws = ws
         self._state.extension_connected = True
         self._disconnected_event.clear()
-        self._extension_ready_event.set()
-        logger.info("Extension connected")
+        self._sync_complete = False
+        # Do NOT set ready event here — wait for tab_changed.
+        # This prevents NO_CHATGPT_TAB when the extension connects
+        # but tab_changed hasn't arrived yet.
+        self._extension_ready_event = asyncio.Event()
+        logger.info("[WS] extension connected (waiting for state sync)")
 
         # Send hello ack
         await self._send(protocol.make_hello_ack())
@@ -122,6 +131,13 @@ class WebSocketServer:
             self._state.assigned_tab_url = url
             logger.info("Tab changed: id=%s url=%s", tab_id, url)
 
+            # On first tab_changed after connection, signal that the
+            # extension is fully ready (connected + synced state).
+            if not self._sync_complete:
+                self._sync_complete = True
+                self._extension_ready_event.set()
+                logger.info("[WS] extension synced (tab=%s)", tab_id)
+
         elif msg_type == protocol.MSG_ACCEPTED:
             request_id = msg.get("requestId")
             if request_id:
@@ -141,7 +157,7 @@ class WebSocketServer:
                 req.state = RequestState.COMPLETED
                 req.future.set_result(response_text)
                 self._state.request_manager.complete_request(request_id, response=response_text)
-                logger.info("Request %s response received (%d chars)", request_id, len(response_text))
+                logger.info("[REQ %s] response received (%d chars)", request_id, len(response_text))
             else:
                 logger.warning("Response for unknown request: %s", request_id)
 
@@ -168,6 +184,21 @@ class WebSocketServer:
             logger.info("Extension hello received")
             await self._send(protocol.make_hello_ack())
 
+        elif msg_type == protocol.MSG_DIAGNOSTIC:
+            request_id = msg.get("requestId", "")
+            component = msg.get("component", "")
+            stage = msg.get("stage", "")
+            message = msg.get("message", "")
+            logger.info(
+                "[REQ %s] DIAGNOSTIC component=%s stage=%s message=%s",
+                request_id, component, stage, message,
+            )
+            # Update the last_stage for the active request
+            req = self._state.request_manager.get_request(request_id)
+            if req:
+                req.last_stage = stage
+                req.last_stage_time = time.time()
+
         else:
             logger.warning("Unknown message type: %s", msg_type)
 
@@ -176,9 +207,10 @@ class WebSocketServer:
         self._state.extension_connected = False
         self._ws = None
         self._disconnected_event.set()
+        self._sync_complete = False
         # Create a fresh event so the next tool call waits for reconnection
         self._extension_ready_event = asyncio.Event()
-        logger.info("Extension disconnected — cleaning up active request")
+        logger.info("[WS] extension disconnected — cleaning up active request")
 
         active = self._state.request_manager.active
         if active:
@@ -219,12 +251,12 @@ class WebSocketServer:
             raise protocol.ErrorCode.NO_CHATGPT_TAB.value
 
         await self._send(protocol.make_prompt(request_id, prompt, timeout_ms))
-        logger.info("Prompt dispatched successfully: request_id=%s", request_id)
+        logger.info("[REQ %s] dispatched", request_id)
 
     async def start(self) -> None:
         """Start the WebSocket server."""
         await self.connect()
-        logger.info("Bridge server started on ws://%s:%d%s", HOST, PORT, WS_PATH)
+        logger.info("[WS] listener ready on ws://%s:%d%s", HOST, PORT, WS_PATH)
 
     async def stop(self) -> None:
         """Stop the WebSocket server."""
@@ -233,12 +265,16 @@ class WebSocketServer:
             await self._server.wait_closed()
             self._server = None
         self._state.extension_connected = False
-        logger.info("Bridge server stopped")
+        logger.info("[WS] server stopped")
 
     async def wait_for_extension_ready(self, timeout: float) -> bool:
-        """Wait for the extension to connect.
+        """Wait for the extension to connect AND sync its state.
 
-        Returns True if the extension connected within the timeout,
+        The extension is considered ready only when:
+        1. The WebSocket is connected, AND
+        2. The extension has sent tab_changed (state synced)
+
+        Returns True if both conditions are met within the timeout,
         False otherwise.
         """
         try:
@@ -247,13 +283,15 @@ class WebSocketServer:
                 timeout=timeout,
             )
             logger.info(
-                "Extension ready (already connected or connected within %.1fs)",
+                "Extension ready (connected and synced within %.1fs)",
                 timeout,
             )
             return True
         except asyncio.TimeoutError:
             logger.warning(
-                "Extension not ready after %.1fs — first invocation will fail",
+                "Extension not ready after %.1fs (connected=%s, synced=%s)",
                 timeout,
+                self._state.extension_connected,
+                self._sync_complete,
             )
             return False
