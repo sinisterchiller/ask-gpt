@@ -79,6 +79,10 @@ class RequestManager:
 
     def complete_request(self, request_id: str, response: str = "", error_code: str = "") -> None:
         """Mark a request as completed or failed, then activate the next queued request."""
+        logger.info("[REQ_MGR] complete_request START(%s, response=%d chars, error=%s), active=%s, queue_size=%d",
+                    request_id, len(response), error_code,
+                    self._active.request_id if self._active else "None",
+                    len(self._queue))
         request = self._requests.get(request_id)
         if request is None:
             logger.warning("Completed unknown request: %s", request_id)
@@ -99,10 +103,12 @@ class RequestManager:
 
         # Clear active reference
         if self._active and self._active.request_id == request_id:
+            logger.info("[REQ_MGR] Clearing active reference for %s", request_id)
             self._active = None
 
         # Notify callback
         if self._on_request_complete:
+            logger.info("[REQ_MGR] Calling _on_request_complete callback for %s", request_id)
             self._on_request_complete(request_id)
 
         # Try to activate next

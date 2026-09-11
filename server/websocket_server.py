@@ -116,6 +116,12 @@ class WebSocketServer:
 
     async def _handle_message(self, raw: str) -> None:
         """Process an incoming message from the extension."""
+        # Log raw message type for transport diagnostics
+        try:
+            preview = raw[:200] if len(raw) > 200 else raw
+            logger.debug("[WS RAW] %s", preview)
+        except Exception:
+            pass
         msg = protocol.parse_message(raw)
         if msg is None:
             logger.warning("Invalid JSON received")
@@ -145,21 +151,45 @@ class WebSocketServer:
 
         elif msg_type == protocol.MSG_RESPONSE:
             if not protocol.validate_response(msg):
-                logger.warning("Invalid response message")
+                logger.warning("Invalid response message: %s", json.dumps(msg) if isinstance(msg, dict) else msg)
                 return
             request_id = msg["requestId"]
             response_text = msg["response"]
             url = msg.get("url", "")
 
+            logger.info("[WS RX] type=response requestId=%s response_len=%d",
+                        request_id, len(response_text))
+            logger.info("[REQ %s] SERVER_RESPONSE_RECEIVED", request_id)
+            logger.info("[WS] Received RESPONSE for request %s (%d chars), ws=%s, ws_state=%s",
+                        request_id, len(response_text), self._ws is not None,
+                        self._ws.state.value if self._ws else "N/A")
+
+            # Only process responses from the current active WebSocket connection.
+            # This prevents stale responses from being processed after a reconnect.
+            # The server's async loop only processes messages on the current connection,
+            # so this is a safety check.
+            if self._ws is None or self._ws.state.value == 3:
+                logger.warning("Response received but WebSocket is not connected")
+                return
+
             req = self._state.request_manager.get_request(request_id)
+            logger.info("[WS] get_request(%s) -> found=%s, future=%s, future.done=%s",
+                        request_id, req is not None,
+                        req.future if req else "N/A",
+                        req.future.done() if (req and req.future) else "N/A")
             if req and req.future and not req.future.done():
+                logger.info("[REQ %s] PENDING_FUTURE_FOUND setting result", request_id)
                 req.response = response_text
                 req.state = RequestState.COMPLETED
                 req.future.set_result(response_text)
+                logger.info("[WS] future.set_result called for %s", request_id)
                 self._state.request_manager.complete_request(request_id, response=response_text)
-                logger.info("[REQ %s] response received (%d chars)", request_id, len(response_text))
+                logger.info("[REQ %s] FUTURE_RESOLVED (%d chars)", request_id, len(response_text))
             else:
-                logger.warning("Response for unknown request: %s", request_id)
+                logger.warning("Response for unknown request or future already done: %s (req=%s, future=%s, future_done=%s)",
+                              request_id, req is not None,
+                              req.future if req else "N/A",
+                              req.future.done() if (req and req.future) else "N/A")
 
         elif msg_type == protocol.MSG_ERROR:
             request_id = msg.get("requestId")
@@ -212,13 +242,16 @@ class WebSocketServer:
         self._extension_ready_event = asyncio.Event()
         logger.info("[WS] extension disconnected — cleaning up active request")
 
-        active = self._state.request_manager.active
-        if active:
-            self._state.request_manager.fail_request(
-                active.request_id,
-                protocol.ErrorCode.EXTENSION_DISCONNECTED.value,
-                "WebSocket disconnected during request",
-            )
+        # request_manager may not be set if called before MCPServer init
+        rm = getattr(self._state, "request_manager", None)
+        if rm:
+            active = rm.active
+            if active:
+                rm.fail_request(
+                    active.request_id,
+                    protocol.ErrorCode.EXTENSION_DISCONNECTED.value,
+                    "WebSocket disconnected during request",
+                )
 
     async def _send(self, message: dict[str, Any]) -> None:
         """Send a message to the extension."""

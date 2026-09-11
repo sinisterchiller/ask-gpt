@@ -296,15 +296,25 @@ class MCPServer:
         request = self._request_manager.create_request(prompt, timeout_ms)
         request_id = request.request_id
 
+        logger.info("[MCP] Created request %s, state=%s, active=%s, future=%s",
+                    request_id, request.state,
+                    self._request_manager.active.request_id if self._request_manager.active else None,
+                    request.future)
+
         # Create a future to await
         loop = asyncio.get_event_loop()
         request.future = loop.create_future()
 
-        # Try to activate
-        active = self._request_manager.activate_next()
+        logger.info("[MCP] Created future for request %s: %s (is_same=%s)",
+                    request_id, request.future, request.future is request.future)
 
-        if active:
-            # Send to extension
+        # The request may have been auto-activated by create_request,
+        # or it may be queued (if another request is active).
+        # In either case, if it's active, dispatch it now.
+        # If it's queued, we'll wait for the active request to finish.
+        if self._request_manager.active and self._request_manager.active.request_id == request_id:
+            logger.info("[MCP] Request %s is ACTIVE — dispatching now", request_id)
+            # This request was auto-activated — dispatch immediately.
             try:
                 await self._ws_server.dispatch_prompt(request_id, prompt, timeout_ms)
                 logger.info("Request %s dispatched to extension", request_id)
@@ -323,12 +333,18 @@ class MCPServer:
                 await self._write(error_resp)
                 return
         else:
-            # Queued — wait with timeout
+            logger.info("[MCP] Request %s is QUEUED — waiting for active request to finish", request_id)
+            # Queued — wait with timeout (will be dispatched by _on_request_complete)
             pass
 
         # Wait for response or timeout
+        logger.info("[MCP] About to await request.future for request %s (timeout=%.1fs)",
+                    request_id, timeout_ms / 1000)
         try:
             await asyncio.wait_for(request.future, timeout=timeout_ms / 1000)
+            logger.info("[MCP] request.future resolved for %s", request_id)
+            logger.info("[REQ %s] MCP_RETURNING response_len=%d",
+                        request_id, len(request.response) if request.response else 0)
             response_text = request.response
 
             result = {
@@ -368,16 +384,23 @@ class MCPServer:
 
     def _on_request_complete(self, request_id: str) -> None:
         """Called when a request completes — activate the next queued request."""
-        logger.info("Request %s complete, checking queue", request_id)
+        logger.info("[MCP] _on_request_complete(%s) called, active=%s, queue_size=%d",
+                    request_id,
+                    self._request_manager.active.request_id if self._request_manager.active else None,
+                    len(self._request_manager.queue))
 
         # If there's an active request, skip (shouldn't happen but safety)
         if self._request_manager.active:
+            logger.warning("[MCP] _on_request_complete: active request still exists, skipping")
             return
 
         # Try to activate next
         next_req = self._request_manager.activate_next()
         if next_req:
+            logger.info("[MCP] Activated next request %s", next_req.request_id)
             asyncio.create_task(self._dispatch_queued_request(next_req))
+        else:
+            logger.info("[MCP] No next request to activate")
 
     async def _dispatch_queued_request(self, request: BridgeRequest) -> None:
         """Dispatch a queued request to the extension."""
@@ -404,7 +427,10 @@ class MCPServer:
         logger.info("[MCP] process started")
 
         # Periodic cleanup of expired requests
-        asyncio.create_task(self._cleanup_loop())
+        try:
+            asyncio.create_task(self._cleanup_loop())
+        except Exception:
+            logger.exception("[MCP] Failed to start cleanup loop")
 
         loop = asyncio.get_event_loop()
         while True:

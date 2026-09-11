@@ -33,6 +33,7 @@ let bridgeEnabled = true;
 let reconnectAttempts = 0;
 let reconnectTimer = null;
 let lastPongAt = 0; // Last pong timestamp for heartbeat health check
+let wsReconnectLocked = false; // Prevent reconnect during active requests
 
 // ------------------------------------------------------------------
 // Service Worker persistence
@@ -78,14 +79,36 @@ async function saveState() {
  * Safe WebSocket send — single entry point that guards against null,
  * closed connections, and stale generations.  Every send goes through
  * here so there is exactly one place to check ws.readyState.
+ *
+ * If the connection appears open but send fails (broken pipe), we
+ * trigger an immediate reconnect so the next message has a chance
+ * to go through a fresh socket.
+ *
  * @param {object} message
  * @returns {boolean} true if sent, false if connection unavailable
  */
 function safeWsSend(message) {
+  // Fast path: connection is confirmed open
   if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(message));
-    return true;
+    try {
+      ws.send(JSON.stringify(message));
+      console.log("[chatgpt-bridge][safeWsSend] SENT type=" + (message.type || "") + " req=" + (message.requestId || "") + " wsGen=" + wsGeneration);
+      return true;
+    } catch (err) {
+      // Send threw — connection is broken even though readyState said OPEN
+      console.error("[chatgpt-bridge][safeWsSend] send threw:", err.message, "wsGen=" + wsGeneration, "readyState=" + ws.readyState);
+      // Trigger reconnect — the old socket is dead
+      ws = null;
+      scheduleReconnect();
+      return false;
+    }
   }
+
+  // Connection is not open — log and return false
+  console.warn("[chatgpt-bridge][safeWsSend] FAILED type=" + (message.type || "") + " req=" + (message.requestId || "") +
+    " ws=" + (ws ? "exists" : "null") +
+    " readyState=" + (ws !== null ? ws.readyState : "N/A") +
+    " wsGen=" + wsGeneration);
   return false;
 }
 
@@ -435,6 +458,10 @@ async function handlePrompt(msg) {
   var prompt = msg.prompt;
   var timeout = msg.timeout || 300000;
 
+  // Lock reconnection while processing this request to prevent
+  // the keep-alive timer from closing the WebSocket mid-response.
+  wsReconnectLocked = true;
+
   console.log("[req_" + requestId + "] request received from server");
   sendDiagnostic(requestId, "background", "request_received");
 
@@ -536,11 +563,120 @@ async function handlePrompt(msg) {
     sendDiagnostic(requestId, "background", "content_response_received",
       "success=" + (result ? result.success : "null") + " response_len=" + (result && result.response ? result.response.length : 0));
 
-    sendResponse(requestId, result, {
-      success: result.success,
-      response: result.response || "",
-      url: tab.url,
-    });
+    // Send response to server. If safeWsSend fails (connection broken),
+    // attempt a reconnect and retry once. This handles the case where
+    // the WebSocket connection drops right after the content script
+    // captures the response but before we forward it to the server.
+
+    // --- DIAGNOSTIC: log exact outbound response payload ---
+    console.log(
+      "[req_" + requestId + "] RESPONSE_FORWARD_START " +
+      "wsExists=" + (ws !== null) +
+      " readyState=" + (ws ? ws.readyState : "N/A") +
+      " msgType=response" +
+      " responseLen=" + (result.response || "").length
+    );
+
+    var responseSent;
+    try {
+      responseSent = sendResponse(requestId, result, {
+        success: result.success,
+        response: result.response || "",
+        url: tab.url,
+      });
+      console.log(
+        "[req_" + requestId + "] sendResponse() returned " + responseSent
+      );
+    } catch (sendErr) {
+      console.error(
+        "[req_" + requestId + "] sendResponse() THREW: " + sendErr.message +
+        " stack=" + sendErr.stack
+      );
+      responseSent = false;
+    }
+
+    if (responseSent) {
+      console.log(
+        "[req_" + requestId + "] RESPONSE_FORWARD_SENT requestId=" + requestId
+      );
+    } else {
+      console.error(
+        "[req_" + requestId + "] RESPONSE_FORWARD_FAILED " +
+        "wsExists=" + (ws !== null) +
+        " readyState=" + (ws ? ws.readyState : "N/A") +
+        " wsGen=" + wsGeneration
+      );
+    }
+
+    if (!responseSent) {
+      // Connection appears broken — try to reconnect and resend.
+      console.log("[req_" + requestId + "] safeWsSend failed, attempting reconnect + resend");
+      try {
+        await new Promise(function (resolve, reject) {
+          var reconnectStarted = false;
+          var origOnOpen = null;
+
+          // Wait for the WebSocket to become open
+          function waitForOpen() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              resolve();
+            } else if (ws && ws.readyState === WebSocket.CONNECTING) {
+              // Connection in progress — wait for onopen
+              if (!reconnectStarted) {
+                reconnectStarted = true;
+                console.log("[req_" + requestId + "] Waiting for reconnect...");
+              }
+              setTimeout(waitForOpen, 100);
+            } else {
+              // Not connected — trigger reconnect
+              if (!reconnectStarted) {
+                reconnectStarted = true;
+                console.log("[req_" + requestId + "] Triggering reconnect...");
+                connectWebSocket();
+              }
+              setTimeout(waitForOpen, 100);
+            }
+          }
+          waitForOpen();
+
+          // Timeout after 10 seconds
+          setTimeout(function () {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+              reject(new Error("Reconnect timed out after 10s"));
+            } else {
+              resolve();
+            }
+          }, 10000);
+        }).then(function () {
+          // Reconnected — try sending again
+          var resendSent = sendResponse(requestId, result, {
+            success: result.success,
+            response: result.response || "",
+            url: tab.url,
+          });
+          if (!resendSent) {
+            console.error("[req_" + requestId + "] Resend also failed after reconnect");
+          } else {
+            console.log("[req_" + requestId + "] Resend succeeded after reconnect");
+          }
+        }).catch(function (err) {
+          console.error("[req_" + requestId + "] Reconnect failed:", err.message);
+          // Send error response to server so it doesn't hang
+          sendResponse(requestId, null, {
+            success: false,
+            error: "WebSocket connection lost during response: " + err.message,
+            code: "CONNECTION_LOST",
+          });
+        });
+      } catch (err) {
+        console.error("[req_" + requestId + "] Reconnect error:", err.message);
+        sendResponse(requestId, null, {
+          success: false,
+          error: "WebSocket connection lost during response: " + err.message,
+          code: "CONNECTION_LOST",
+        });
+      }
+    }
 
   } catch (err) {
     console.error("[chatgpt-bridge] Content script error:", err.message);
@@ -551,25 +687,31 @@ async function handlePrompt(msg) {
       code: "CHATGPT_COMPOSER_NOT_FOUND",
     });
   }
+
+  // Unlock reconnection — the request is complete (success or error).
+  wsReconnectLocked = false;
 }
 
 function sendResponse(requestId, result, serverMsg) {
+  var message;
   if (result && result.success) {
-    serverMsg = serverMsg || {
+    // Caller may pass a partial object with { success, response, url }
+    // — always construct the full protocol message.
+    message = {
       type: "response",
       requestId: requestId,
-      response: result.response,
-      url: result.url || "",
+      response: (serverMsg && serverMsg.response) || result.response || "",
+      url: (serverMsg && serverMsg.url) || "",
     };
   } else {
-    serverMsg = serverMsg || {
+    message = {
       type: "error",
       requestId: requestId,
-      code: result ? result.code || "UNKNOWN_ERROR" : "UNKNOWN_ERROR",
-      message: result ? result.error || "Unknown error" : "Unknown error",
+      code: (serverMsg && serverMsg.code) || (result ? result.code || "UNKNOWN_ERROR" : "UNKNOWN_ERROR"),
+      message: (serverMsg && serverMsg.message) || (result ? result.error || "Unknown error" : "Unknown error"),
     };
   }
-  safeWsSend(serverMsg);
+  return safeWsSend(message);
 }
 
 // ------------------------------------------------------------------
@@ -733,15 +875,18 @@ chrome.runtime.onInstalled.addListener(function () {
 });
 
 // Periodic keep-alive (service workers can be killed)
+// Only sends pings — reconnect is handled by onclose/scheduleReconnect.
+// Skips reconnect if wsReconnectLocked is true (active request in flight).
 setInterval(function () {
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
+  if (wsReconnectLocked) {
+    // Don't reconnect while a request is in flight — onclose will handle it.
+    return;
+  }
+  if (ws && ws.readyState === WebSocket.OPEN && wsGeneration > 0) {
+    safeWsSend({ type: "ping" });
+  } else if (!ws || ws.readyState !== WebSocket.OPEN) {
     console.log("[chatgpt-bridge] Connection lost, reconnecting...");
     connectWebSocket();
-  } else {
-    // Only send if this is still the current socket
-    if (wsGeneration > 0) {
-      safeWsSend({ type: "ping" });
-    }
   }
 }, 15000);
 

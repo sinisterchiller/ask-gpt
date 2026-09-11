@@ -133,8 +133,10 @@ var responseResolve = null; // Promise resolve from waitForResponse
 var responseTimeoutHandle = null;
 var generationStartAt = 0; // Timestamp when generation observation started
 
-// Synchronous lock to prevent duplicate submissions from multiple listeners
-var processingLock = false;
+// Synchronous lock to prevent duplicate submissions from multiple listeners.
+// Stored on globalThis so it survives re-injection (each executeScript creates
+// a new scope with its own copy of module-level variables).
+var processingLock = globalThis.__chatgptBridgeProcessingLock || false;
 
 // ------------------------------------------------------------------
 // Message handling
@@ -158,6 +160,7 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
       return false;
     }
     processingLock = true;
+    globalThis.__chatgptBridgeProcessingLock = true;
 
     submitPrompt(diagRequestId, request.prompt).then(function (result) {
       console.log("[content script] submit_prompt result:", result);
@@ -179,6 +182,7 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
       sendResponse({ success: false, error: err.message, code: err.code || "UNKNOWN_ERROR" });
     }).finally(function () {
       processingLock = false;
+      globalThis.__chatgptBridgeProcessingLock = false;
     });
     return true;
   }
@@ -439,7 +443,8 @@ function waitForResponse(requestId) {
         });
         clearInterval(pollInterval);
         var messages = SELECTORS.assistantMessages();
-        var newMsgEl = messages[messages.length - 1];
+        // ChatGPT renders newest messages first in the DOM
+        var newMsgEl = messages[0];
         if (newMsgEl) {
           // Set module-level for startObservation
           messageEl = newMsgEl;
@@ -467,6 +472,11 @@ function waitForResponse(requestId) {
 }
 
 function startObservation() {
+  // Track message count to detect when a new message appears.
+  // ChatGPT renders messages oldest-first in the DOM.
+  // When count increases, the NEW message is at the END of the NodeList.
+  var prevMsgCount = 0;
+
   stateTimer = setInterval(function () {
     var stopBtn = getStopButton();
     var stopVisible = false;
@@ -486,28 +496,30 @@ function startObservation() {
       return;
     }
 
-    // Re-query assistant messages and pick the one with the most text.
-    // ChatGPT puts "Thinking" in one element and the actual response
-    // in a DIFFERENT element. We must follow the element that grows.
+    // Re-query assistant messages.
     var allMsgs = SELECTORS.assistantMessages();
-    var bestEl = null;
-    var bestLen = 0;
-    for (var i = 0; i < allMsgs.length; i++) {
-      var t = allMsgs[i].innerText || "";
-      if (t.length > bestLen) {
-        bestLen = t.length;
-        bestEl = allMsgs[i];
+    if (!allMsgs || allMsgs.length === 0) return;
+    var newMsgCount = allMsgs.length;
+
+    // When a new message appears, pick the LAST one (newest).
+    // Skip "Thinking" indicators which may be at the end.
+    if (newMsgCount > prevMsgCount) {
+      prevMsgCount = newMsgCount;
+      // Walk backwards from the end, skip "Thinking" elements
+      for (var i = newMsgCount - 1; i >= 0; i--) {
+        var candidate = allMsgs[i];
+        var candidateText = candidate.innerText || "";
+        // Skip "Thinking" or very short elements
+        if (candidateText.length > 10) {
+          messageEl = candidate;
+          lastText = "";
+          stableCount = 0;
+          break;
+        }
       }
     }
-    if (!bestEl) return;
 
-    // If we switched to a different element (e.g., from Thinking to response),
-    // reset state for the new element
-    if (bestEl !== messageEl) {
-      messageEl = bestEl;
-      lastText = "";
-      stableCount = 0;
-    }
+    if (!messageEl) return;
 
     var currentText = messageEl.innerText || "";
     var elapsed = Date.now() - generationStartAt;
@@ -526,7 +538,7 @@ function startObservation() {
           " len_gte_20=" + (currentText.length >= 20) +
           " state=" + state +
           " stableCount=" + stableCount +
-          " bestLen=" + bestLen,
+          " msgCount=" + newMsgCount,
       });
     }
 
