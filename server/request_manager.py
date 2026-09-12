@@ -60,6 +60,8 @@ class RequestManager:
 
     @property
     def is_full(self) -> bool:
+        if MAX_QUEUE_SIZE is None:
+            return False
         return len(self._queue) >= MAX_QUEUE_SIZE
 
     def activate_next(self) -> BridgeRequest | None:
@@ -175,7 +177,7 @@ class RequestManager:
             "active": self._active.request_id if self._active else None,
             "queued": len(self._queue),
             "queue_ids": [r.request_id for r in self._queue],
-            "max_queue_size": MAX_QUEUE_SIZE,
+            "max_queue_size": MAX_QUEUE_SIZE if MAX_QUEUE_SIZE is not None else "unlimited",
         }
 
     # --- Private ---

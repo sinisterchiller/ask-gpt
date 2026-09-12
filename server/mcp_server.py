@@ -209,7 +209,7 @@ class MCPServer:
             await self._write(error_resp)
             return
 
-        if len(prompt) > MAX_PROMPT_SIZE:
+        if MAX_PROMPT_SIZE is not None and len(prompt) > MAX_PROMPT_SIZE:
             error_resp = {
                 "jsonrpc": "2.0",
                 "id": msg_id,
@@ -280,7 +280,7 @@ class MCPServer:
             return
 
         # Check queue size
-        if self._request_manager.is_full:
+        if MAX_QUEUE_SIZE is not None and self._request_manager.is_full:
             error_resp = {
                 "jsonrpc": "2.0",
                 "id": msg_id,

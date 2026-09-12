@@ -79,7 +79,7 @@ def validate_prompt(message: dict[str, Any]) -> bool:
         return False
     if "prompt" not in message or not isinstance(message["prompt"], str):
         return False
-    if len(message["prompt"]) > MAX_PROMPT_SIZE:
+    if MAX_PROMPT_SIZE is not None and len(message["prompt"]) > MAX_PROMPT_SIZE:
         return False
     # Extra fields are tolerated but requestId and prompt are required
     return True
@@ -95,7 +95,7 @@ def validate_response(message: dict[str, Any]) -> bool:
         return False
     if "response" not in message or not isinstance(message["response"], str):
         return False
-    if len(message["response"]) > MAX_RESPONSE_SIZE:
+    if MAX_RESPONSE_SIZE is not None and len(message["response"]) > MAX_RESPONSE_SIZE:
         return False
     return True
 

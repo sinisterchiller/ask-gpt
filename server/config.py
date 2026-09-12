@@ -32,9 +32,9 @@ def get_token() -> str:
 
 
 # Limits
-MAX_PROMPT_SIZE = 16_000  # characters
-MAX_RESPONSE_SIZE = 64_000  # characters
-MAX_QUEUE_SIZE = 10
+MAX_PROMPT_SIZE = None  # no limit
+MAX_RESPONSE_SIZE = None  # no limit
+MAX_QUEUE_SIZE = None  # no limit
 REQUEST_TIMEOUT_MS = 300_000  # 5 minutes default
 
 # Extension connection readiness timeout (seconds)

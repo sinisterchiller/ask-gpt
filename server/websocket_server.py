@@ -50,7 +50,7 @@ class WebSocketServer:
             HOST,
             PORT,
             process_request=self._process_request,
-            max_size=2**20,  # 1MB max message
+            # No max_size — unlimited message size
             # Default ping_interval=20, ping_timeout=20 — browser handles
             # protocol-level ping/pong transparently; application-level
             # pings ({"type":"ping"}) are a separate keepalive layer.

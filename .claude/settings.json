@@ -1,8 +1,8 @@
 {
   "mcpServers": {
-    "chatgpt-bridge": {
-      "command": "/bin/bash",
-      "args": ["/Users/anuragkoushik/Desktop/Proj/ask-gpt/run_mcp.sh"],
+    "consultation": {
+      "command": "/Users/anuragkoushik/Desktop/Proj/ask-gpt/.venv/bin/python",
+      "args": ["-m", "server"],
       "env": {
         "PYTHONUNBUFFERED": "1"
       }

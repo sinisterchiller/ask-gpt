@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 import sys
 
@@ -25,12 +26,22 @@ from .websocket_server import WebSocketServer
 
 
 def setup_logging() -> None:
-    """Configure logging."""
+    """Configure logging — writes to stderr and to a persistent log file."""
+    log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "server.log")
+    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+
+    # Ensure the file exists (so shell redirect doesn't create an empty file)
+    if not os.path.exists(log_file):
+        open(log_file, "a").close()
+
     logging.basicConfig(
         level=logging.INFO,
         format=f"%(asctime)s [{LOG_PREFIX}] %(name)s %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
-        stream=sys.stderr,
+        handlers=[
+            logging.StreamHandler(sys.stderr),
+            logging.FileHandler(log_file),
+        ],
     )
 
 
