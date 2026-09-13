@@ -1,13 +1,3 @@
 {
-  "mcpServers": {
-    "chatgpt-bridge": {
-      "type": "stdio",
-      "command": "/Users/anuragkoushik/Desktop/Proj/ask-gpt/.venv/bin/python",
-      "args": ["-m", "server"],
-      "cwd": "/Users/anuragkoushik/Desktop/Proj/ask-gpt",
-      "env": {
-        "PYTHONUNBUFFERED": "1"
-      }
-    }
-  }
+  "mcpServers": {}
 }

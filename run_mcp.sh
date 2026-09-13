@@ -1,4 +1,8 @@
-#!/bin/bash
-# Wrapper script for the MCP server that logs errors
+#!/usr/bin/env bash
+set -euo pipefail
+
 cd /Users/anuragkoushik/Desktop/Proj/ask-gpt
-/Users/anuragkoushik/Desktop/Proj/ask-gpt/.venv/bin/python -m server 2>&1
+
+export PYTHONUNBUFFERED=1
+
+exec /Users/anuragkoushik/Desktop/Proj/ask-gpt/.venv/bin/python -m server

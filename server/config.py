@@ -35,7 +35,7 @@ def get_token() -> str:
 MAX_PROMPT_SIZE = None  # no limit
 MAX_RESPONSE_SIZE = None  # no limit
 MAX_QUEUE_SIZE = None  # no limit
-REQUEST_TIMEOUT_MS = 300_000  # 5 minutes default
+REQUEST_TIMEOUT_MS = 1_800_000  # 30 minutes
 
 # Extension connection readiness timeout (seconds)
 # How long to wait for the extension to connect on first invocation.

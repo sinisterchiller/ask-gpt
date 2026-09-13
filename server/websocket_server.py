@@ -17,6 +17,11 @@ from websockets.server import ServerConnection
 
 from . import protocol
 from .config import HOST, PORT, WS_PATH, get_token
+from .port_cleanup import (
+    cleanup_stale_listener,
+    remove_pid_file,
+    write_pid_file,
+)
 from .models import RequestState, ServerState
 
 logger = logging.getLogger("chatgpt-bridge.ws")
@@ -287,17 +292,28 @@ class WebSocketServer:
         logger.info("[REQ %s] dispatched", request_id)
 
     async def start(self) -> None:
-        """Start the WebSocket server."""
+        """Start the WebSocket server.
+
+        Cleans up any stale bridge listener on startup before binding.
+        """
+        # Once-per-process startup: clean stale listener BEFORE binding.
+        await asyncio.to_thread(cleanup_stale_listener, PORT, 2.0)
         await self.connect()
+        # Binding succeeded — advertise ownership.
+        write_pid_file(PORT)
         logger.info("[WS] listener ready on ws://%s:%d%s", HOST, PORT, WS_PATH)
 
     async def stop(self) -> None:
-        """Stop the WebSocket server."""
+        """Stop the WebSocket server and clean up PID file."""
         if self._server:
             self._server.close()
-            await self._server.wait_closed()
+            try:
+                await asyncio.wait_for(self._server.wait_closed(), timeout=3.0)
+            except (asyncio.TimeoutError, Exception):
+                pass
             self._server = None
         self._state.extension_connected = False
+        remove_pid_file()
         logger.info("[WS] server stopped")
 
     async def wait_for_extension_ready(self, timeout: float) -> bool:

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 import time
 from typing import Any
@@ -57,6 +58,7 @@ class MCPServer:
         self._message_id = 0
         self._initialized = False
         self._client_capabilities: dict[str, Any] = {}
+        self._uses_add_reader: bool = False
 
     # --- MCP message handling ---
 
@@ -87,6 +89,25 @@ class MCPServer:
         elif msg_type == "logging/message":
             # Some clients send logging messages — no response expected
             logger.debug("Received logging/message")
+        elif msg_type == "prompts/list":
+            # MCP SDK requests prompts list — return empty (no prompts supported)
+            logger.debug("prompts/list — returning empty")
+            await self._write({
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {"prompts": []},
+            })
+        elif msg_type == "resources/list":
+            # MCP SDK requests resources list — return empty (no resources supported)
+            logger.debug("resources/list — returning empty")
+            await self._write({
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {"resources": []},
+            })
+        elif msg_type == "notifications/roots/list_changed":
+            # Some SDKs send this notification — no response expected
+            logger.debug("notifications/roots/list_changed")
         elif msg_type is None:
             # Notification without a method field — ignore (no response)
             pass
@@ -155,7 +176,7 @@ class MCPServer:
                                 },
                                 "timeout": {
                                     "type": "integer",
-                                    "description": "Maximum time to wait for a response in milliseconds (default: 300000 = 5 minutes).",
+                                    "description": "Maximum time to wait for a response in milliseconds (default: 1800000 = 30 minutes).",
                                 },
                             },
                             "required": ["prompt"],
@@ -423,37 +444,90 @@ class MCPServer:
         sys.stdout.flush()
 
     async def run(self) -> None:
-        """Run the MCP server, reading from stdin."""
+        """Run the MCP server, reading from stdin.
+
+        Uses loop.add_reader() for non-blocking stdin I/O so that
+        cancellation and shutdown don't leave a blocked executor thread.
+        Falls back to run_in_executor for pipe stdin (add_reader only
+        works with regular files/TTYs, not pipes).
+        """
         logger.info("[MCP] process started")
 
         # Periodic cleanup of expired requests
+        self._cleanup_task: asyncio.Task[None] | None = None
         try:
-            asyncio.create_task(self._cleanup_loop())
+            self._cleanup_task = asyncio.create_task(self._cleanup_loop())
         except Exception:
             logger.exception("[MCP] Failed to start cleanup loop")
 
         loop = asyncio.get_event_loop()
-        while True:
-            try:
-                line = await loop.run_in_executor(None, sys.stdin.readline)
-            except (EOFError, OSError):
-                logger.info("EOF reading from stdin, shutting down")
-                break
+        stdin_fd = sys.stdin.fileno()
 
-            line = line.strip()
-            if not line:
-                # Empty line means EOF — stdin was closed
-                logger.info("Empty line from stdin (EOF), shutting down")
-                break
+        # Check if we can use add_reader (works for TTYs/regular files,
+        # not for pipes — pipes raise OSError on macOS).
+        self._uses_add_reader = False
+        try:
+            loop.add_reader(stdin_fd, lambda: None)
+            loop.remove_reader(stdin_fd)
+            self._uses_add_reader = True
+        except OSError:
+            self._uses_add_reader = False
 
+        if self._uses_add_reader:
+            # Buffered line reading state
+            _buf = ""
+
+            def _stdin_handler() -> None:
+                nonlocal _buf
+                try:
+                    data = os.read(stdin_fd, 8192)
+                except OSError:
+                    loop.remove_reader(stdin_fd)
+                    return
+                if not data:
+                    loop.remove_reader(stdin_fd)
+                    return
+                _buf += data.decode("utf-8", errors="replace")
+                while "\n" in _buf:
+                    line, _buf = _buf.split("\n", 1)
+                    line = line.strip()
+                    if line:
+                        try:
+                            asyncio.ensure_future(self.handle_message(line))
+                        except Exception:
+                            logger.exception("Error handling stdin message")
+
+            loop.add_reader(stdin_fd, _stdin_handler)
+
+            # Wait until the cleanup task is cancelled (on shutdown).
+            # The add_reader callback runs independently on the event loop.
             try:
-                await self.handle_message(line)
+                if self._cleanup_task:
+                    await self._cleanup_task
             except asyncio.CancelledError:
-                # Request timeout cancelled this coroutine — do NOT propagate.
-                # Clean up and continue processing the next message.
-                logger.warning("Request cancelled/timeout — continuing server loop")
-            except Exception:
-                logger.exception("Unhandled error in message handling — continuing")
+                pass
+        else:
+            # Pipe stdin — fall back to run_in_executor.
+            # The caller (main()) must explicitly cancel the MCP task
+            # and shut down the executor before returning.
+            while True:
+                try:
+                    line = await loop.run_in_executor(None, sys.stdin.readline)
+                except (EOFError, OSError):
+                    logger.info("EOF reading from stdin, shutting down")
+                    break
+
+                line = line.strip()
+                if not line:
+                    logger.info("Empty line from stdin (EOF), shutting down")
+                    break
+
+                try:
+                    await self.handle_message(line)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("Unhandled error in message handling — continuing")
 
     async def _cleanup_loop(self) -> None:
         """Periodically clean up expired requests."""

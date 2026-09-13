@@ -1,5 +1,3 @@
 {
-  "enabledMcpjsonServers": [
-    "chatgpt-bridge"
-  ]
+  "enabledMcpjsonServers": []
 }

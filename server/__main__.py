@@ -1,10 +1,9 @@
 """Allow running the server as: python -m server"""
 import sys
 import traceback
-from server.main import main
-
 try:
     import asyncio
+    from .main import main
     asyncio.run(main())
 except Exception as e:
     print(f"Fatal error: {e}", file=sys.stderr)

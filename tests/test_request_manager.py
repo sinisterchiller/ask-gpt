@@ -26,7 +26,7 @@ class TestCreateRequest:
     def test_default_timeout(self):
         rm = RequestManager()
         req = rm.create_request("Hello")
-        assert req.timeout_ms == 300000  # REQUEST_TIMEOUT_MS
+        assert req.timeout_ms == 1800000  # REQUEST_TIMEOUT_MS (30 minutes)
 
     def test_auto_activates_first(self):
         rm = RequestManager()

@@ -131,32 +131,102 @@ async def main() -> None:
         # Run MCP server and shutdown trigger concurrently.
         # The MCP server runs until stdin closes (EOF).
         # Signals set stop_event, which triggers shutdown.
-        # Request timeouts are handled inside the MCP server loop
-        # and do NOT propagate here.
+        # We poll stop_event in a loop so asyncio can process the signal
+        # handler between iterations — stop_event.wait() alone blocks
+        # indefinitely and does not wake when the event is set from a
+        # signal handler in all asyncio versions.
         mcp_task = asyncio.create_task(mcp_server.run())
         logger.info("[MAIN] MCP server running, waiting for stdin...")
 
         try:
-            await asyncio.gather(mcp_task, stop_event.wait())
+            while not stop_event.is_set():
+                # Wait for EITHER the stop event OR the MCP task to complete.
+                # We create a new task each iteration because stop_event.wait()
+                # is a one-shot Future — once resolved, it must be awaited again.
+                stop_task = asyncio.create_task(stop_event.wait())
+                try:
+                    done, pending = await asyncio.wait(
+                        [stop_task, mcp_task],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                except asyncio.CancelledError:
+                    stop_task.cancel()
+                    break
+
+                # If MCP task completed (stdin EOF), exit loop normally
+                if mcp_task in done:
+                    break
+
+                # If stop_event was set, exit loop — MCP task will be cancelled
+                if stop_task in done:
+                    break
+
+                # Cancel any pending tasks
+                for t in pending:
+                    t.cancel()
+                    try:
+                        await t
+                    except (asyncio.CancelledError, Exception):
+                        pass
         except asyncio.CancelledError:
             pass
-        finally:
-            # Gracefully shut down: close WebSocket, then the MCP server
-            # will exit when stdin is closed.
-            await ws_server.stop()
-            token_server.close()
+
+        # MCP task is done or cancelled — now shut down remaining services.
+        # First cancel the MCP server's background cleanup task.
+        if hasattr(mcp_server, '_cleanup_task') and mcp_server._cleanup_task:
+            mcp_server._cleanup_task.cancel()
             try:
-                await token_server.wait_closed()
+                await asyncio.wait_for(mcp_server._cleanup_task, timeout=1.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
+
+        # Cancel MCP task if still running
+        if not mcp_task.done():
+            mcp_task.cancel()
+            try:
+                await asyncio.wait_for(mcp_task, timeout=3.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+
+        # If the MCP server used run_in_executor for stdin (pipe stdin),
+        # the executor thread may still be blocked on readline().
+        # Shut it down with wait=False — the thread will be abandoned,
+        # but the process exits immediately after.
+        if hasattr(mcp_server, '_uses_add_reader') and not mcp_server._uses_add_reader:
+            loop = asyncio.get_running_loop()
+            loop.run_in_executor(None, lambda: None)  # ensure executor exists
+            try:
+                loop.shutdown_default_executor(wait=False)
             except Exception:
                 pass
-            # Cancel MCP task if still running (e.g., stdin not closed)
-            if not mcp_task.done():
-                mcp_task.cancel()
-                try:
-                    await mcp_task
-                except asyncio.CancelledError:
-                    pass
-            logger.info("Bridge server stopped")
+
+        # Now close the WebSocket server (MCP task is done/cancelled)
+        await ws_server.stop()
+
+        # Close token HTTP server
+        token_server.close()
+        try:
+            await asyncio.wait_for(token_server.wait_closed(), timeout=3.0)
+        except (asyncio.TimeoutError, Exception):
+            pass
+
+        # Cancel any remaining tasks to ensure event loop can exit
+        all_tasks = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+        for t in all_tasks:
+            t.cancel()
+            try:
+                await asyncio.wait_for(t, timeout=0.5)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
+
+        logger.info("Bridge server stopped")
+
+        # If we shut down the executor above (pipe stdin case), we must
+        # exit explicitly — asyncio.run() would hang trying to shut it
+        # down again.  For TTY/add-reader stdin the executor is empty
+        # and asyncio.run() handles cleanup naturally.
+        if hasattr(mcp_server, '_uses_add_reader') and not mcp_server._uses_add_reader:
+            sys.exit(0)
     except Exception as e:
         logger.exception("[MAIN] Fatal error during startup: %s", e)
         raise
