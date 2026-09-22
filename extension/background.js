@@ -456,7 +456,7 @@ function sendDiagnostic(requestId, component, stage, message) {
 async function handlePrompt(msg) {
   var requestId = msg.requestId;
   var prompt = msg.prompt;
-  var timeout = msg.timeout || 300000;
+  var timeout = msg.timeout || 1800000;
 
   // Lock reconnection while processing this request to prevent
   // the keep-alive timer from closing the WebSocket mid-response.

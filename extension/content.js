@@ -403,7 +403,7 @@ function setComposerText(composer, text) {
 
 function waitForResponse(requestId) {
   return new Promise(function (resolve, reject) {
-    var timeoutMs = 300000;
+    var timeoutMs = 1800000;
 
     // Set module-level state for startObservation to access
     messageEl = null;

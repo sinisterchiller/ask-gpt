@@ -21,7 +21,11 @@ from .config import (
     MAX_QUEUE_SIZE,
     REQUEST_TIMEOUT_MS,
 )
-from .models import RequestState, ServerState
+
+# Directory for persisting ChatGPT responses (for recovery when
+# Claude Code's background task system drops the result payload).
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results")
+from .models import BridgeRequest, RequestState, ServerState
 from .protocol import (
     ErrorCode,
     encode,
@@ -48,6 +52,10 @@ MSG_LOG_MESSAGE = "logging/message"
 class MCPServer:
     """MCP stdio server that exposes ask_chatgpt."""
 
+    # Maximum number of persisted results to retain (cleanup policy).
+    # Oldest results are purged when this limit is exceeded.
+    _MAX_PERSISTED_RESULTS = 50
+
     def __init__(self, state: ServerState, ws_server: WebSocketServer) -> None:
         self._state = state
         self._ws_server = ws_server
@@ -59,6 +67,12 @@ class MCPServer:
         self._initialized = False
         self._client_capabilities: dict[str, Any] = {}
         self._uses_add_reader: bool = False
+        # Track the most recently completed request for latest-result recovery.
+        # This is essential when Claude Code's background task system drops
+        # the request_id from completion metadata.
+        self._latest_result_id: str | None = None
+        # Ensure results directory exists
+        os.makedirs(RESULTS_DIR, exist_ok=True)
 
     # --- MCP message handling ---
 
@@ -166,7 +180,26 @@ class MCPServer:
                 "tools": [
                     {
                         "name": "ask_chatgpt",
-                        "description": "Send a prompt to an assigned ChatGPT browser tab and wait for the completed response.",
+                        "description": (
+                            "Send a prompt to an assigned ChatGPT browser tab and wait "
+                            "for the completed response.\n\n"
+                            "RECOVERY PROCEDURE (read carefully):\n"
+                            "Claude Code may automatically background long-running tool calls "
+                            "(typically >120 seconds). When this happens, the response payload "
+                            "is dropped from the task completion notification. This means:\n"
+                            "- You call ask_chatgpt(prompt=\"...\")\n"
+                            "- The task completes with status=completed\n"
+                            "- But you receive NO response content (empty or missing)\n\n"
+                            "IF this happens, DO NOT call ask_chatgpt again. The ChatGPT "
+                            "request already completed successfully on the server side. "
+                            "Instead, recover the response:\n"
+                            "1. Call get_chatgpt_result() with no arguments: { }\n"
+                            "2. It will return the exact ChatGPT response that was lost.\n"
+                            "3. Use that response as your answer.\n\n"
+                            "This is the ONLY correct recovery path. Never retry ask_chatgpt "
+                            "when the background task completed but dropped the content — "
+                            "it will create a duplicate ChatGPT request."
+                        ),
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -181,7 +214,38 @@ class MCPServer:
                             },
                             "required": ["prompt"],
                         },
-                    }
+                    },
+                    {
+                        "name": "get_chatgpt_result",
+                        "description": (
+                            "Retrieve a previously completed ChatGPT response. "
+                            "This is the recovery tool for when Claude Code backgrounds "
+                            "ask_chatgpt and drops the response payload.\n\n"
+                            "Usage:\n"
+                            "- Call with no arguments: { } to get the most recent completed "
+                            "ChatGPT result. No request_id needed.\n"
+                            "- Call with request_id to get a specific result by ID.\n\n"
+                            "Response states:\n"
+                            "- COMPLETED: response text is available, use it.\n"
+                            "- PENDING: ChatGPT is still processing the request. Try again later.\n"
+                            "- NO_RESULT: no completed result found. Call ask_chatgpt first.\n"
+                            "- EXPIRED: the request failed/timed out or result was cleaned up."
+                        ),
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "request_id": {
+                                    "type": "string",
+                                    "description": (
+                                        "Optional request_id from ask_chatgpt completion "
+                                        "metadata (e.g., 'req_xxxxxxxx'). Omit to retrieve "
+                                        "the most recent completed ChatGPT result."
+                                    ),
+                                },
+                            },
+                            "required": [],
+                        },
+                    },
                 ]
             },
         }
@@ -195,7 +259,7 @@ class MCPServer:
 
         logger.info("Tool call: name=%s args=%s", tool_name, arguments)
 
-        if tool_name != "ask_chatgpt":
+        if tool_name != "ask_chatgpt" and tool_name != "get_chatgpt_result":
             error_resp = {
                 "jsonrpc": "2.0",
                 "id": msg_id,
@@ -205,6 +269,10 @@ class MCPServer:
                 },
             }
             await self._write(error_resp)
+            return
+
+        if tool_name == "get_chatgpt_result":
+            await self._handle_get_chatgpt_result(msg, msg_id)
             return
 
         prompt = arguments.get("prompt", "")
@@ -368,6 +436,12 @@ class MCPServer:
                         request_id, len(request.response) if request.response else 0)
             response_text = request.response
 
+            # Persist the response to disk for recovery in case
+            # Claude Code's background task system drops the result payload.
+            # Also track this as the latest result for latest-result recovery.
+            self._persist_result(request_id, response_text, prompt=prompt)
+            self._latest_result_id = request_id
+
             result = {
                 "jsonrpc": "2.0",
                 "id": msg_id,
@@ -378,7 +452,6 @@ class MCPServer:
                             "text": response_text,
                         }
                     ],
-                    "request_id": request_id,
                 },
             }
             await self._write(result)
@@ -402,6 +475,307 @@ class MCPServer:
             }
             await self._write(error_resp)
             logger.warning("Request %s timed out%s", request_id, stage_info)
+
+    def _persist_result(self, request_id: str, response_text: str,
+                        prompt: str = "", error_code: str = "",
+                        status: str = "completed") -> None:
+        """Persist a ChatGPT response to disk for recovery.
+
+        The result is stored in a JSON file named by request_id with
+        rich metadata (created_at, completed_at, status, prompt, error_code).
+        This provides a durable backup in case Claude Code's background
+        task system drops the result payload.
+
+        Args:
+            request_id: The bridge request ID.
+            response_text: The ChatGPT response text.
+            prompt: The original prompt sent to ChatGPT.
+            error_code: Error code if the request failed (empty if succeeded).
+            status: One of "completed", "failed", "timed_out", "cancelled".
+        """
+        try:
+            result_path = os.path.join(RESULTS_DIR, f"{request_id}.json")
+            result_data = {
+                "request_id": request_id,
+                "prompt": prompt,
+                "response": response_text,
+                "status": status,
+                "error_code": error_code,
+                "created_at": time.time(),
+                "completed_at": time.time(),
+                "persisted_at": time.time(),
+            }
+            with open(result_path, "w") as f:
+                json.dump(result_data, f)
+            # Enforce retention policy after writing
+            self._purge_old_results()
+            logger.info("[MCP] Persisted result for %s (%d chars, status=%s) to %s",
+                        request_id, len(response_text), status, result_path)
+        except Exception:
+            logger.exception("[MCP] Failed to persist result for %s", request_id)
+
+    def _purge_old_results(self) -> None:
+        """Enforce retention policy: keep at most _MAX_PERSISTED_RESULTS results.
+
+        Purges the oldest results (by filename/mtime) when the limit is exceeded.
+        """
+        try:
+            existing = [
+                f for f in os.listdir(RESULTS_DIR)
+                if f.endswith(".json")
+            ]
+            if len(existing) <= self._MAX_PERSISTED_RESULTS:
+                return
+            # Sort by modification time (oldest first) and remove excess
+            existing_with_mtime = []
+            for fname in existing:
+                fpath = os.path.join(RESULTS_DIR, fname)
+                try:
+                    mtime = os.path.getmtime(fpath)
+                    existing_with_mtime.append((mtime, fname))
+                except OSError:
+                    pass
+            existing_with_mtime.sort()  # oldest first
+            to_remove = existing_with_mtime[:len(existing) - self._MAX_PERSISTED_RESULTS]
+            for _mtime, fname in to_remove:
+                fpath = os.path.join(RESULTS_DIR, fname)
+                try:
+                    os.remove(fpath)
+                    logger.info("[MCP] Purged old result: %s", fname)
+                except OSError:
+                    pass
+        except Exception:
+            logger.exception("[MCP] Failed to purge old results")
+
+    def _get_persisted_result(self, request_id: str) -> dict[str, Any]:
+        """Retrieve a persisted ChatGPT response with metadata.
+
+        Returns a dict with keys:
+            found: bool - True if the result exists
+            status: str - "completed", "failed", "timed_out", etc.
+            response: str - the response text (empty if not found/error)
+            error: str - error message if not found
+        """
+        try:
+            result_path = os.path.join(RESULTS_DIR, f"{request_id}.json")
+            if not os.path.exists(result_path):
+                return {
+                    "found": False,
+                    "status": "NO_RESULT",
+                    "response": "",
+                    "error": (
+                        f"Result not found for request_id '{request_id}'. "
+                        "The request may not have completed yet, or the result "
+                        "may have been cleaned up."
+                    ),
+                }
+            with open(result_path, "r") as f:
+                result_data = json.load(f)
+            return {
+                "found": True,
+                "status": result_data.get("status", "completed"),
+                "response": result_data.get("response", ""),
+                "error": "",
+            }
+        except json.JSONDecodeError:
+            return {
+                "found": False,
+                "status": "EXPIRED",
+                "response": "",
+                "error": f"Result file for '{request_id}' is corrupted.",
+            }
+        except Exception as e:
+            return {
+                "found": False,
+                "status": "EXPIRED",
+                "response": "",
+                "error": f"Error reading result for '{request_id}': {e}",
+            }
+
+    def _get_latest_persisted_result(self) -> dict[str, Any]:
+        """Get the most recently completed ChatGPT result.
+
+        Looks through persisted result files and returns the one with the
+        latest completed_at timestamp that has status "completed".
+
+        Returns a dict with keys:
+            found: bool
+            status: str - "COMPLETED", "PENDING", "NO_RESULT", "EXPIRED"
+            response: str
+            request_id: str - the request_id of the result found
+            error: str
+        """
+        try:
+            existing = [
+                f for f in os.listdir(RESULTS_DIR)
+                if f.endswith(".json")
+            ]
+            if not existing:
+                return {
+                    "found": False,
+                    "status": "NO_RESULT",
+                    "response": "",
+                    "request_id": "",
+                    "error": "No ChatGPT results have been persisted yet. "
+                             "Call ask_chatgpt and wait for completion.",
+                }
+
+            # Load all results and find the latest completed one
+            latest = None
+            latest_time = 0.0
+            for fname in existing:
+                fpath = os.path.join(RESULTS_DIR, fname)
+                try:
+                    with open(fpath, "r") as f:
+                        data = json.load(f)
+                    completed_at = data.get("completed_at", 0)
+                    status = data.get("status", "")
+                    # Prefer completed results; fall back to most recent
+                    if status == "completed" and completed_at > latest_time:
+                        latest = data
+                        latest_time = completed_at
+                    elif status != "completed" and completed_at > latest_time:
+                        # No completed result yet — return the most recent
+                        # (it may still be pending)
+                        latest = data
+                        latest_time = completed_at
+                except (json.JSONDecodeError, OSError):
+                    continue
+
+            if latest is None:
+                return {
+                    "found": False,
+                    "status": "NO_RESULT",
+                    "response": "",
+                    "request_id": "",
+                    "error": "No valid ChatGPT results found.",
+                }
+
+            request_id = latest.get("request_id", "")
+            status = latest.get("status", "completed")
+            response = latest.get("response", "")
+            error_code = latest.get("error_code", "")
+
+            if status == "completed":
+                return {
+                    "found": True,
+                    "status": "COMPLETED",
+                    "response": response,
+                    "request_id": request_id,
+                    "error": "",
+                }
+            elif status in ("failed", "timed_out"):
+                return {
+                    "found": True,
+                    "status": "EXPIRED",
+                    "response": "",
+                    "request_id": request_id,
+                    "error": (
+                        f"CHATGPT_RESULT_EXPIRED: The most recent ChatGPT "
+                        f"request ({request_id}) ended with status '{status}'"
+                        + (f" ({error_code})" if error_code else "")
+                        + ". No successful result is available."
+                    ),
+                }
+            else:
+                # Pending or unknown state
+                return {
+                    "found": True,
+                    "status": "PENDING",
+                    "response": "",
+                    "request_id": request_id,
+                    "error": (
+                        f"CHATGPT_RESULT_PENDING: The most recent ChatGPT "
+                        f"request ({request_id}) is still processing "
+                        f"(state: {status}). Try again later."
+                    ),
+                }
+
+        except Exception as e:
+            return {
+                "found": False,
+                "status": "NO_RESULT",
+                "response": "",
+                "request_id": "",
+                "error": f"Error scanning results directory: {e}",
+            }
+
+    async def _handle_get_chatgpt_result(self, msg: dict[str, Any], msg_id: Any) -> None:
+        """Handle the get_chatgpt_result tool call.
+
+        Supports two modes:
+        - With request_id: look up the specific result by ID.
+        - Without request_id: return the most recent completed result
+          (for recovery when Claude Code backgrounded ask_chatgpt and
+           dropped the request_id from completion metadata).
+        """
+        params = msg.get("params", {})
+        arguments = params.get("arguments", {})
+        request_id = arguments.get("request_id", "")
+
+        if request_id:
+            # Specific request lookup
+            info = self._get_persisted_result(request_id)
+            if info["found"]:
+                result = {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": info["response"],
+                            }
+                        ],
+                    },
+                }
+            else:
+                result = {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"CHATGPT_RESULT_NOT_RETRIEVED: {info['error']}",
+                            }
+                        ],
+                        "isError": True,
+                    },
+                }
+        else:
+            # Latest-result recovery — no request_id needed
+            info = self._get_latest_persisted_result()
+            if info["found"] and info["status"] == "COMPLETED":
+                result = {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": info["response"],
+                            }
+                        ],
+                    },
+                }
+            else:
+                # PENDING, NO_RESULT, or EXPIRED
+                result = {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "result": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": f"CHATGPT_{info['status']}: {info['error']}",
+                            }
+                        ],
+                        "isError": True,
+                    },
+                }
+
+        await self._write(result)
 
     def _on_request_complete(self, request_id: str) -> None:
         """Called when a request completes — activate the next queued request."""
